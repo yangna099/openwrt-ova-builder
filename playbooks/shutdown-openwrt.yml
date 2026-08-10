@@ -1,0 +1,19 @@
+---
+- name: Shut down OpenWrt cleanly
+  hosts: openwrt
+  gather_facts: false
+
+  tasks:
+    - name: Flush pending writes and schedule a poweroff
+      ansible.builtin.raw: |
+        set -eu
+        sync
+        command -v setsid >/dev/null 2>&1 || {
+          echo 'Error: setsid is required to schedule a detached poweroff.' >&2
+          exit 1
+        }
+        setsid sh -c 'sleep 2; poweroff' </dev/null >/dev/null 2>&1 &
+        shutdown_pid=$!
+        sleep 1
+        kill -0 "$shutdown_pid"
+      changed_when: true

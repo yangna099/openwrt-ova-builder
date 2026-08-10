@@ -1,0 +1,61 @@
+---
+- name: Prevent LAN clients from accessing WAN through OpenWrt
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    lan_firewall_zone: lan
+    wan_firewall_zone: wan
+    lan_to_wan_block_rule: block_lan_to_wan
+
+  tasks:
+    - name: Remove LAN-to-WAN forwarding and reject LAN-to-WAN traffic
+      ansible.builtin.raw: |
+        set -eu
+
+        command -v uci >/dev/null 2>&1 || {
+          echo 'Error: the OpenWrt uci command is required.' >&2
+          exit 1
+        }
+
+        # Remove named and anonymous forwarding sections. Anonymous UCI section
+        # indexes change after deletion, so find and remove one section per loop.
+        while :; do
+          forwarding_to_delete=''
+          for forwarding in $(
+            uci -q show firewall |
+              sed -n 's/^firewall\.\([^=]*\)=forwarding$/\1/p'
+          ); do
+            source_zone="$(uci -q get "firewall.$forwarding.src" || true)"
+            destination_zone="$(uci -q get "firewall.$forwarding.dest" || true)"
+            if [ "$source_zone" = '{{ lan_firewall_zone }}' ] && \
+               [ "$destination_zone" = '{{ wan_firewall_zone }}' ]; then
+              forwarding_to_delete=$forwarding
+              break
+            fi
+          done
+
+          [ -n "$forwarding_to_delete" ] || break
+          uci -q delete "firewall.$forwarding_to_delete"
+        done
+
+        # Keep an explicit reject rule as a guard against permissive zone
+        # forwarding policies or a later generic forwarding rule.
+        uci -q delete firewall.{{ lan_to_wan_block_rule }} || true
+        uci set firewall.{{ lan_to_wan_block_rule }}='rule'
+        uci set firewall.{{ lan_to_wan_block_rule }}.name='Block-LAN-To-WAN'
+        uci set firewall.{{ lan_to_wan_block_rule }}.src='{{ lan_firewall_zone }}'
+        uci set firewall.{{ lan_to_wan_block_rule }}.dest='{{ wan_firewall_zone }}'
+        uci set firewall.{{ lan_to_wan_block_rule }}.proto='all'
+        uci set firewall.{{ lan_to_wan_block_rule }}.target='REJECT'
+        uci set firewall.{{ lan_to_wan_block_rule }}.enabled='1'
+
+        uci commit firewall
+        /etc/init.d/firewall reload
+      changed_when: true
+
+    - name: Report LAN-to-WAN isolation
+      ansible.builtin.debug:
+        msg: >-
+          LAN-to-WAN forwarding is disabled. Devices using the OpenWrt LAN IP
+          as their gateway cannot access the Internet through the WAN zone.

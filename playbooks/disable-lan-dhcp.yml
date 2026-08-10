@@ -1,0 +1,26 @@
+---
+- name: Disable DHCP services on the OpenWrt LAN interface
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    lan_interface: lan
+
+  tasks:
+    - name: Disable LAN IPv4 DHCP, DHCPv6, and router advertisements
+      ansible.builtin.raw: |
+        set -eu
+
+        uci set dhcp.{{ lan_interface }}='dhcp'
+        uci set dhcp.{{ lan_interface }}.interface='{{ lan_interface }}'
+        # `ignore=1` disables dnsmasq's IPv4 DHCP service for this interface.
+        uci set dhcp.{{ lan_interface }}.ignore='1'
+        # Explicitly disable odhcpd's DHCPv6 and RA services as well.
+        uci set dhcp.{{ lan_interface }}.dhcpv6='disabled'
+        uci set dhcp.{{ lan_interface }}.ra='disabled'
+        uci set dhcp.{{ lan_interface }}.ndp='disabled'
+        uci commit dhcp
+
+        /etc/init.d/dnsmasq restart
+        /etc/init.d/odhcpd restart
+      changed_when: true

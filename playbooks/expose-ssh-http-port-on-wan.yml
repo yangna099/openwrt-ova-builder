@@ -1,0 +1,60 @@
+---
+- name: Expose the OpenWrt SSH and HTTP ports on WAN
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    wan_firewall_zone: wan
+    ssh_wan_port: 22
+    http_wan_port: 80
+    ssh_wan_firewall_rule: allow_ssh_from_wan
+    http_wan_firewall_rule: allow_http_from_wan
+
+  pre_tasks:
+    - name: Validate the SSH and HTTP WAN ports
+      ansible.builtin.assert:
+        that:
+          - ssh_wan_port | string is match('^[0-9]+$')
+          - ssh_wan_port | int >= 1
+          - ssh_wan_port | int <= 65535
+          - http_wan_port | string is match('^[0-9]+$')
+          - http_wan_port | int >= 1
+          - http_wan_port | int <= 65535
+        fail_msg: >-
+          ssh_wan_port and http_wan_port must be integers between 1 and 65535.
+
+  tasks:
+    - name: Allow SSH and HTTP connections from the WAN firewall zone
+      ansible.builtin.raw: |
+        set -eu
+
+        command -v uci >/dev/null 2>&1 || {
+          echo 'Error: the OpenWrt uci command is required.' >&2
+          exit 1
+        }
+
+        uci set firewall.{{ ssh_wan_firewall_rule }}='rule'
+        uci set firewall.{{ ssh_wan_firewall_rule }}.name='Allow-SSH-From-WAN'
+        uci set firewall.{{ ssh_wan_firewall_rule }}.src='{{ wan_firewall_zone }}'
+        uci set firewall.{{ ssh_wan_firewall_rule }}.proto='tcp'
+        uci set firewall.{{ ssh_wan_firewall_rule }}.dest_port='{{ ssh_wan_port | int }}'
+        uci set firewall.{{ ssh_wan_firewall_rule }}.target='ACCEPT'
+        uci set firewall.{{ ssh_wan_firewall_rule }}.enabled='1'
+
+        uci set firewall.{{ http_wan_firewall_rule }}='rule'
+        uci set firewall.{{ http_wan_firewall_rule }}.name='Allow-HTTP-From-WAN'
+        uci set firewall.{{ http_wan_firewall_rule }}.src='{{ wan_firewall_zone }}'
+        uci set firewall.{{ http_wan_firewall_rule }}.proto='tcp'
+        uci set firewall.{{ http_wan_firewall_rule }}.dest_port='{{ http_wan_port | int }}'
+        uci set firewall.{{ http_wan_firewall_rule }}.target='ACCEPT'
+        uci set firewall.{{ http_wan_firewall_rule }}.enabled='1'
+
+        uci commit firewall
+        /etc/init.d/firewall reload
+      changed_when: true
+
+    - name: Report the exposed management ports
+      ansible.builtin.debug:
+        msg: >-
+          TCP ports {{ ssh_wan_port }} (SSH) and {{ http_wan_port }} (HTTP) are
+          allowed from the OpenWrt WAN firewall zone.

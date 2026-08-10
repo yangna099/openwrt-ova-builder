@@ -1,0 +1,76 @@
+---
+- name: Configure an OpenWrt WireGuard server
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    wg_interface: wgserver
+    wg_address: 10.20.0.1/24
+    wg_port: 51820
+    wg_firewall_zone: wireguard
+    lan_firewall_zone: lan
+    wan_firewall_zone: wan
+    wg_wan_firewall_rule: allow_wireguard_from_wan
+    wg_to_lan_forwarding: wireguard_to_lan
+    wg_to_wan_forwarding: wireguard_to_wan
+
+  tasks:
+    - name: Configure the WireGuard interface and firewall
+      ansible.builtin.raw: |
+        set -eu
+
+        command -v wg >/dev/null 2>&1 || {
+          echo 'Error: WireGuard is not installed. Run install-wireguard.yml first.' >&2
+          exit 1
+        }
+
+        private_key="$(uci -q get network.{{ wg_interface }}.private_key || true)"
+        if [ -z "$private_key" ]; then
+          private_key="$(umask 077; wg genkey)"
+          echo 'changed: generated server key'
+        fi
+
+        uci set network.{{ wg_interface }}='interface'
+        uci set network.{{ wg_interface }}.proto='wireguard'
+        uci set network.{{ wg_interface }}.private_key="$private_key"
+        uci set network.{{ wg_interface }}.listen_port='{{ wg_port }}'
+        # `uci -q` hides the message but still exits with 1 if the option has
+        # not been created yet.  Do not let the first run stop here.
+        uci -q delete network.{{ wg_interface }}.addresses || true
+        uci add_list network.{{ wg_interface }}.addresses='{{ wg_address }}'
+
+        uci set firewall.{{ wg_firewall_zone }}='zone'
+        uci set firewall.{{ wg_firewall_zone }}.name='{{ wg_firewall_zone }}'
+        uci set firewall.{{ wg_firewall_zone }}.input='ACCEPT'
+        uci set firewall.{{ wg_firewall_zone }}.output='ACCEPT'
+        uci set firewall.{{ wg_firewall_zone }}.forward='ACCEPT'
+        uci set firewall.{{ wg_firewall_zone }}.masq='1'
+        uci set firewall.{{ wg_firewall_zone }}.mtu_fix='1'
+        uci -q delete firewall.{{ wg_firewall_zone }}.network || true
+        uci add_list firewall.{{ wg_firewall_zone }}.network='{{ wg_interface }}'
+
+        uci set firewall.{{ wg_to_lan_forwarding }}='forwarding'
+        uci set firewall.{{ wg_to_lan_forwarding }}.src='{{ wg_firewall_zone }}'
+        uci set firewall.{{ wg_to_lan_forwarding }}.dest='{{ lan_firewall_zone }}'
+        uci set firewall.{{ wg_to_wan_forwarding }}='forwarding'
+        uci set firewall.{{ wg_to_wan_forwarding }}.src='{{ wg_firewall_zone }}'
+        uci set firewall.{{ wg_to_wan_forwarding }}.dest='{{ wan_firewall_zone }}'
+
+        uci set firewall.{{ wg_wan_firewall_rule }}='rule'
+        uci set firewall.{{ wg_wan_firewall_rule }}.name='Allow-WireGuard-From-WAN'
+        uci set firewall.{{ wg_wan_firewall_rule }}.src='{{ wan_firewall_zone }}'
+        uci set firewall.{{ wg_wan_firewall_rule }}.proto='udp'
+        uci set firewall.{{ wg_wan_firewall_rule }}.dest_port='{{ wg_port }}'
+        uci set firewall.{{ wg_wan_firewall_rule }}.target='ACCEPT'
+
+        uci commit network
+        uci commit firewall
+        /etc/init.d/network reload
+        /etc/init.d/firewall reload
+        # dnsmasq binds to configured interfaces. Restart it after wgserver exists
+        # so WireGuard clients can use the server tunnel address for DNS.
+        /etc/init.d/dnsmasq restart
+
+        echo 'WireGuard server public key:'
+        printf '%s\n' "$private_key" | wg pubkey
+      changed_when: true

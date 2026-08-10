@@ -1,0 +1,222 @@
+---
+- name: Create an OpenWrt WireGuard client peer and write its configuration file
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    wg_interface: wgserver
+    wg_port: 51820
+    wg_client_name: client1
+    lan_interface: lan
+    # Use dnsmasq on the OpenWrt WireGuard address by default. Override this
+    # with -e wg_client_dns='1.1.1.1' to use a different resolver.
+    wg_client_dns: 10.20.0.1
+    # The endpoint IPv4 address is read automatically from OpenWrt's LAN.
+    # Route all IPv4 traffic through the WireGuard server (full tunnel).
+    # Override it with -e wg_client_allowed_ips='...' for split tunnelling.
+    # IPv6 is not included because the server playbook configures IPv4 only.
+    wg_client_allowed_ips: 0.0.0.0/0
+    # This file is created in clients/ beside playbooks/, not on
+    # OpenWrt. `playbook_dir | dirname` is the project root for this playbook.
+    # Override it with -e wg_client_config_file=/path/to/client.conf if needed.
+    wg_client_config_file: "{{ playbook_dir | dirname }}/clients/{{ wg_client_name }}.conf"
+
+  pre_tasks:
+    - name: Validate client parameters
+      ansible.builtin.assert:
+        that:
+          - wg_client_name is match('^[A-Za-z0-9_-]+$')
+          - wg_client_dns | string | length > 0
+        fail_msg: >-
+          Set valid wg_client_name and wg_client_dns values. Client names may
+          contain letters, digits, underscores, and hyphens.
+
+    - name: Read the WireGuard endpoint address from OpenWrt
+      ansible.builtin.raw: |
+        set -eu
+
+        command -v ubus >/dev/null 2>&1 || {
+          echo 'Error: the OpenWrt ubus command is required.' >&2
+          exit 1
+        }
+        command -v jsonfilter >/dev/null 2>&1 || {
+          echo 'Error: the OpenWrt jsonfilter command is required.' >&2
+          exit 1
+        }
+
+        endpoint_host="$({
+          ubus call network.interface.{{ lan_interface }} status 2>/dev/null || true
+        } | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null || true)"
+
+        # A static interface can still be read from UCI if it is currently down.
+        if [ -z "$endpoint_host" ]; then
+          endpoint_host="$(uci -q get network.{{ lan_interface }}.ipaddr || true)"
+          endpoint_host=${endpoint_host%%/*}
+        fi
+
+        if ! printf '%s\n' "$endpoint_host" | awk -F. '
+          NF != 4 { exit 1 }
+          {
+            for (i = 1; i <= 4; i++) {
+              if ($i !~ /^[0-9]+$/ || $i > 255) exit 1
+            }
+          }
+        '; then
+          echo 'Error: no valid IPv4 address found on the OpenWrt LAN interface.' >&2
+          exit 1
+        fi
+
+        printf '%s\n' "$endpoint_host"
+      register: wireguard_endpoint_address
+      changed_when: false
+
+    - name: Store the discovered WireGuard endpoint address
+      ansible.builtin.set_fact:
+        wg_endpoint_host: "{{ wireguard_endpoint_address.stdout | regex_replace('\\r', '') | trim }}"
+
+  tasks:
+    - name: Create the client peer and render its WireGuard configuration
+      ansible.builtin.raw: |
+        set -eu
+
+        command -v wg >/dev/null 2>&1 || {
+          echo 'Error: WireGuard is not installed. Run install-wireguard.yml first.' >&2
+          exit 1
+        }
+        command -v lock >/dev/null 2>&1 || {
+          echo 'Error: the OpenWrt lock command is required.' >&2
+          exit 1
+        }
+
+        ipv4_to_int() {
+          printf '%s\n' "$1" | awk -F. 'NF != 4 { exit 1 } { value = 0; for (i = 1; i <= 4; i++) { if ($i !~ /^[0-9]+$/ || $i > 255) exit 1; value = value * 256 + $i } printf "%.0f\n", value }'
+        }
+
+        int_to_ipv4() {
+          value=$1
+          printf '%d.%d.%d.%d\n' \
+            $((value / 16777216 % 256)) \
+            $((value / 65536 % 256)) \
+            $((value / 256 % 256)) \
+            $((value % 256))
+        }
+
+        allocation_lock='/var/lock/wireguard-client-allocation.lock'
+        lock "$allocation_lock"
+        trap 'lock -u "$allocation_lock"' 0
+
+        server_private_key="$(uci -q get network.{{ wg_interface }}.private_key || true)"
+        if [ -z "$server_private_key" ]; then
+          echo 'Error: WireGuard server interface {{ wg_interface }} is not configured.' >&2
+          exit 1
+        fi
+
+        server_cidr=''
+        for configured_address in $(uci -q get network.{{ wg_interface }}.addresses || true); do
+          case "$configured_address" in
+            *.*/*)
+              server_cidr="$configured_address"
+              break
+              ;;
+          esac
+        done
+        if [ -z "$server_cidr" ]; then
+          echo 'Error: the WireGuard server has no IPv4 CIDR address.' >&2
+          exit 1
+        fi
+
+        server_ip=${server_cidr%/*}
+        prefix=${server_cidr#*/}
+        case "$prefix" in
+          ''|*[!0-9]*)
+            echo "Error: invalid WireGuard IPv4 prefix: $prefix" >&2
+            exit 1
+            ;;
+        esac
+        if [ "$prefix" -lt 1 ] || [ "$prefix" -gt 30 ]; then
+          echo "Error: WireGuard IPv4 prefix must be between 1 and 30: $prefix" >&2
+          exit 1
+        fi
+
+        server_ip_int="$(ipv4_to_int "$server_ip")" || {
+          echo "Error: invalid WireGuard server IPv4 address: $server_ip" >&2
+          exit 1
+        }
+        subnet_size=$((1 << (32 - prefix)))
+        network_int=$((server_ip_int / subnet_size * subnet_size))
+        last_host_int=$((network_int + subnet_size - 2))
+        network_config="$(uci -q show network)"
+
+        client_address=''
+        candidate_int=$((network_int + 1))
+        while [ "$candidate_int" -le "$last_host_int" ]; do
+          if [ "$candidate_int" -ne "$server_ip_int" ]; then
+            candidate_ip="$(int_to_ipv4 "$candidate_int")"
+            if ! printf '%s\n' "$network_config" | grep -Fq ".allowed_ips='$candidate_ip/32'"; then
+              client_address="$candidate_ip/32"
+              break
+            fi
+          fi
+          candidate_int=$((candidate_int + 1))
+        done
+        if [ -z "$client_address" ]; then
+          echo "Error: no free client IPv4 address remains in $server_cidr." >&2
+          exit 1
+        fi
+
+        peer_section='wgclient_{{ wg_client_name }}'
+        if uci -q get "network.$peer_section" >/dev/null; then
+          echo "Error: client '{{ wg_client_name }}' already exists; choose a new wg_client_name." >&2
+          exit 1
+        fi
+
+        client_private_key="$(umask 077; wg genkey)"
+        client_public_key="$(printf '%s\n' "$client_private_key" | wg pubkey)"
+        server_public_key="$(printf '%s\n' "$server_private_key" | wg pubkey)"
+
+        uci set "network.$peer_section=wireguard_{{ wg_interface }}"
+        uci set "network.$peer_section.description={{ wg_client_name }}"
+        uci set "network.$peer_section.public_key=$client_public_key"
+        # On the first run this option does not exist. `uci -q` hides its
+        # message but still returns 1, which must not stop this script.
+        uci -q delete "network.$peer_section.allowed_ips" || true
+        uci add_list "network.$peer_section.allowed_ips=$client_address"
+        uci set "network.$peer_section.route_allowed_ips=0"
+        uci commit network
+        # `network reload` can leave an already-running WireGuard interface
+        # unchanged, so the new UCI peer never reaches the kernel interface.
+        ifdown '{{ wg_interface }}' || true
+        ifup '{{ wg_interface }}'
+
+        cat <<EOF
+        [Interface]
+        PrivateKey = $client_private_key
+        Address = $client_address
+        DNS = {{ wg_client_dns }}
+
+        [Peer]
+        PublicKey = $server_public_key
+        Endpoint = {{ wg_endpoint_host }}:{{ wg_port }}
+        AllowedIPs = {{ wg_client_allowed_ips }}
+        PersistentKeepalive = 25
+        EOF
+      register: wireguard_client_config
+      changed_when: true
+
+    - name: Create the local WireGuard client configuration directory
+      ansible.builtin.file:
+        path: "{{ wg_client_config_file | dirname }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+
+    - name: Write the WireGuard client configuration locally
+      ansible.builtin.copy:
+        content: "{{ wireguard_client_config.stdout | regex_replace('\\r', '') }}"
+        dest: "{{ wg_client_config_file }}"
+        mode: '0600'
+      delegate_to: localhost
+
+    - name: Report the generated client configuration file
+      ansible.builtin.debug:
+        msg: "WireGuard client configuration written to: {{ wg_client_config_file }}"

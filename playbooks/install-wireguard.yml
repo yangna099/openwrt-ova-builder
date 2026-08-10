@@ -1,0 +1,59 @@
+---
+- name: Install WireGuard and its LuCI protocol integration on OpenWrt
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    wireguard_packages:
+      - kmod-wireguard
+      - wireguard-tools
+      - luci-proto-wireguard
+
+  tasks:
+    - name: Install WireGuard packages for both client and server roles
+      ansible.builtin.raw: |
+        set -eu
+        packages='{{ wireguard_packages | join(" ") }}'
+        missing=''
+
+        if command -v apk >/dev/null 2>&1; then
+          for package in $packages; do
+            apk info -e "$package" >/dev/null 2>&1 || missing="$missing $package"
+          done
+          if [ -n "$missing" ]; then
+            apk -U add $missing
+            echo 'changed: WireGuard packages installed'
+          fi
+        elif command -v opkg >/dev/null 2>&1; then
+          for package in $packages; do
+            opkg list-installed "$package" | grep -q "^$package " || missing="$missing $package"
+          done
+          if [ -n "$missing" ]; then
+            opkg update
+            opkg install $missing
+            echo 'changed: WireGuard packages installed'
+          fi
+        else
+          echo 'Error: neither apk nor opkg is available.' >&2
+          exit 1
+        fi
+      register: wireguard_install
+      changed_when: "'changed: WireGuard packages installed' in wireguard_install.stdout"
+
+    - name: Reload LuCI after installing its WireGuard protocol module
+      ansible.builtin.raw: |
+        rm -f /tmp/luci-indexcache*
+        rm -rf /tmp/luci-modulecache
+        killall -HUP rpcd 2>/dev/null || true
+        /etc/init.d/uhttpd reload
+      when: wireguard_install.changed
+      changed_when: false
+
+    - name: Show installed WireGuard package status
+      ansible.builtin.raw: |
+        if command -v apk >/dev/null 2>&1; then
+          apk info {{ wireguard_packages | join(' ') }}
+        else
+          opkg list-installed {{ wireguard_packages | join(' ') }}
+        fi
+      changed_when: false

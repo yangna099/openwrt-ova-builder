@@ -1,0 +1,7 @@
+/.ansible/
+/.venv/
+/clients/
+/disk/
+/keys/
+/output/
+*.ini

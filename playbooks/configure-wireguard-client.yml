@@ -1,0 +1,373 @@
+---
+- name: Configure OpenWrt as a WireGuard client gateway
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    wg_interface: wgclient
+    wg_peer: wgclient_peer
+    wg_firewall_zone: wireguard
+    lan_interface: lan
+    lan_firewall_zone: lan
+    wan_firewall_zone: wan
+    lan_to_wg_forwarding: lan_to_wireguard
+    wg_route_table: 51820
+    wg_lan_route: wgclient_lan_default
+    wg_lan_rule: wgclient_from_lan
+    wg_lan_rule_priority: 30000
+
+  pre_tasks:
+    - name: Require the wg-quick configuration file variable
+      ansible.builtin.assert:
+        that:
+          - wg_quick_config_file | default('') | string | trim | length > 0
+        fail_msg: >-
+          Pass a wg-quick configuration file with
+          -e wg_quick_config_file=/path/to/client.conf.
+
+    - name: Resolve the wg-quick path relative to the project directory
+      ansible.builtin.set_fact:
+        wg_quick_config_path: >-
+          {{ (wg_quick_config_file | expanduser)
+             if (wg_quick_config_file | expanduser).startswith('/')
+             else (playbook_dir | dirname) ~ '/' ~
+                  (wg_quick_config_file | expanduser) }}
+
+    - name: Check the local wg-quick configuration file
+      ansible.builtin.stat:
+        path: "{{ wg_quick_config_path }}"
+      delegate_to: localhost
+      register: wg_quick_config_stat
+
+    - name: Require a local wg-quick configuration file
+      ansible.builtin.assert:
+        that:
+          - wg_quick_config_stat.stat.exists
+          - wg_quick_config_stat.stat.isreg
+        fail_msg: >-
+          WireGuard configuration file not found:
+          {{ wg_quick_config_path }}
+
+    - name: Read the wg-quick configuration on the controller
+      ansible.builtin.set_fact:
+        wg_quick_address: >-
+          {{ lookup('ansible.builtin.ini', 'Address', section='Interface',
+                    file=wg_quick_config_path, default='') }}
+        wg_quick_private_key: >-
+          {{ lookup('ansible.builtin.ini', 'PrivateKey', section='Interface',
+                    file=wg_quick_config_path, default='') }}
+        wg_quick_dns: >-
+          {{ lookup('ansible.builtin.ini', 'DNS', section='Interface',
+                    file=wg_quick_config_path, default='') }}
+        wg_quick_mtu: >-
+          {{ lookup('ansible.builtin.ini', 'MTU', section='Interface',
+                    file=wg_quick_config_path, default='') }}
+        wg_quick_public_key: >-
+          {{ lookup('ansible.builtin.ini', 'PublicKey', section='Peer',
+                    file=wg_quick_config_path, default='') }}
+        wg_quick_preshared_key: >-
+          {{ lookup('ansible.builtin.ini', 'PresharedKey', section='Peer',
+                    file=wg_quick_config_path, default='') }}
+        wg_quick_allowed_ips: >-
+          {{ lookup('ansible.builtin.ini', 'AllowedIPs', section='Peer',
+                    file=wg_quick_config_path, default='') }}
+        wg_quick_endpoint: >-
+          {{ lookup('ansible.builtin.ini', 'Endpoint', section='Peer',
+                    file=wg_quick_config_path, default='') }}
+        wg_quick_keepalive: >-
+          {{ lookup('ansible.builtin.ini', 'PersistentKeepalive', section='Peer',
+                    file=wg_quick_config_path, default='25') }}
+      no_log: true
+
+    - name: Validate the wg-quick configuration
+      ansible.builtin.assert:
+        that:
+          - wg_quick_address | length > 0
+          - wg_quick_private_key | length > 0
+          - wg_quick_dns | length > 0
+          - wg_quick_public_key | length > 0
+          - wg_quick_allowed_ips | length > 0
+          - wg_quick_endpoint | length > 0
+          - "'0.0.0.0/0' in wg_quick_allowed_ips"
+        fail_msg: >-
+          The wg-quick file must define Interface Address, PrivateKey and DNS,
+          one Peer with PublicKey, Endpoint and AllowedIPs, and AllowedIPs must
+          include 0.0.0.0/0 for LAN full-tunnel routing.
+
+  tasks:
+    - name: Configure the WireGuard client, routing, DNS, and firewall
+      ansible.builtin.raw: |
+        set -eu
+
+        command -v wg >/dev/null 2>&1 || {
+          echo 'Error: WireGuard is not installed. Run install-wireguard.yml first.' >&2
+          exit 1
+        }
+        for required_command in ip jsonfilter ubus; do
+          command -v "$required_command" >/dev/null 2>&1 || {
+            echo "Error: $required_command is required for LAN policy routing." >&2
+            exit 1
+          }
+        done
+
+        addresses={{ wg_quick_address | quote }}
+        private_key={{ wg_quick_private_key | quote }}
+        dns_servers={{ wg_quick_dns | quote }}
+        mtu={{ wg_quick_mtu | quote }}
+        public_key={{ wg_quick_public_key | quote }}
+        preshared_key={{ wg_quick_preshared_key | quote }}
+        allowed_ips={{ wg_quick_allowed_ips | quote }}
+        endpoint={{ wg_quick_endpoint | quote }}
+        keepalive={{ wg_quick_keepalive | quote }}
+
+        trim_value() {
+          printf '%s\n' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+        }
+
+        add_comma_separated_list() {
+          option=$1
+          values=$2
+          old_ifs=$IFS
+          IFS=,
+          for value in $values; do
+            value="$(trim_value "$value")"
+            [ -z "$value" ] || uci add_list "$option=$value"
+          done
+          IFS=$old_ifs
+        }
+
+        case "$endpoint" in
+          \[*\]:*)
+            endpoint_host=${endpoint%%]*}
+            endpoint_host=${endpoint_host#\[}
+            endpoint_port=${endpoint##*:}
+            ;;
+          *:*)
+            endpoint_host=${endpoint%:*}
+            endpoint_port=${endpoint##*:}
+            ;;
+          *)
+            echo "Error: invalid WireGuard endpoint: $endpoint" >&2
+            exit 1
+            ;;
+        esac
+        case "$endpoint_port" in
+          ''|*[!0-9]*)
+            echo "Error: invalid WireGuard endpoint port: $endpoint_port" >&2
+            exit 1
+            ;;
+        esac
+        if [ "$endpoint_port" -lt 1 ] || [ "$endpoint_port" -gt 65535 ]; then
+          echo "Error: WireGuard endpoint port is out of range: $endpoint_port" >&2
+          exit 1
+        fi
+        command -v resolveip >/dev/null 2>&1 || {
+          echo 'Error: resolveip is required for the WireGuard endpoint.' >&2
+          exit 1
+        }
+        resolved_endpoint="$(resolveip -t 10 "$endpoint_host" | sed -n '1p')"
+        if [ -z "$resolved_endpoint" ]; then
+          echo "Error: cannot resolve WireGuard endpoint: $endpoint_host" >&2
+          exit 1
+        fi
+        endpoint_host=$resolved_endpoint
+        if [ -n "$mtu" ]; then
+          case "$mtu" in
+            *[!0-9]*)
+              echo "Error: invalid WireGuard MTU: $mtu" >&2
+              exit 1
+              ;;
+          esac
+        fi
+        case "$keepalive" in
+          ''|*[!0-9]*)
+            echo "Error: invalid WireGuard PersistentKeepalive: $keepalive" >&2
+            exit 1
+            ;;
+        esac
+
+        uci set network.{{ wg_interface }}='interface'
+        uci set network.{{ wg_interface }}.proto='wireguard'
+        uci set network.{{ wg_interface }}.private_key="$private_key"
+        uci set network.{{ wg_interface }}.metric='10'
+        uci -q delete network.{{ wg_interface }}.addresses || true
+        add_comma_separated_list network.{{ wg_interface }}.addresses "$addresses"
+        uci -q delete network.{{ wg_interface }}.dns || true
+        add_comma_separated_list network.{{ wg_interface }}.dns "$dns_servers"
+        if [ -n "$mtu" ]; then
+          uci set network.{{ wg_interface }}.mtu="$mtu"
+        else
+          uci -q delete network.{{ wg_interface }}.mtu || true
+        fi
+
+        uci set network.{{ wg_peer }}='wireguard_{{ wg_interface }}'
+        uci set network.{{ wg_peer }}.description={{ wg_quick_config_path | basename | quote }}
+        uci set network.{{ wg_peer }}.public_key="$public_key"
+        uci set network.{{ wg_peer }}.endpoint_host="$endpoint_host"
+        uci set network.{{ wg_peer }}.endpoint_port="$endpoint_port"
+        uci set network.{{ wg_peer }}.persistent_keepalive="$keepalive"
+        # Do not install AllowedIPs in the main routing table. A dedicated
+        # policy-routing table below sends only LAN traffic through WireGuard,
+        # leaving OpenWrt management and the peer endpoint on WAN.
+        uci set network.{{ wg_peer }}.route_allowed_ips='0'
+        uci -q delete network.{{ wg_peer }}.allowed_ips || true
+        add_comma_separated_list network.{{ wg_peer }}.allowed_ips "$allowed_ips"
+        if [ -n "$preshared_key" ]; then
+          uci set network.{{ wg_peer }}.preshared_key="$preshared_key"
+        else
+          uci -q delete network.{{ wg_peer }}.preshared_key || true
+        fi
+
+        uci set network.{{ wg_lan_route }}='route'
+        uci set network.{{ wg_lan_route }}.interface='{{ wg_interface }}'
+        uci set network.{{ wg_lan_route }}.target='0.0.0.0/0'
+        uci set network.{{ wg_lan_route }}.table='{{ wg_route_table }}'
+
+        uci set network.{{ wg_lan_rule }}='rule'
+        uci set network.{{ wg_lan_rule }}.in='{{ lan_interface }}'
+        uci set network.{{ wg_lan_rule }}.lookup='{{ wg_route_table }}'
+        uci set network.{{ wg_lan_rule }}.priority='{{ wg_lan_rule_priority }}'
+
+        # dnsmasq originates its upstream queries on the router, so those
+        # packets do not match the LAN-input rule. Add destination rules for
+        # IPv4 DNS servers from the wg-quick file so DNS also uses WireGuard.
+        dns_rule_index=1
+        while [ "$dns_rule_index" -le 8 ]; do
+          uci -q delete "network.wgclient_dns_$dns_rule_index" || true
+          dns_rule_index=$((dns_rule_index + 1))
+        done
+        dns_rule_index=1
+        old_ifs=$IFS
+        IFS=,
+        for dns_server in $dns_servers; do
+          dns_server="$(trim_value "$dns_server")"
+          if ! printf '%s\n' "$dns_server" | awk -F. '
+            NF != 4 { exit 1 }
+            {
+              for (i = 1; i <= 4; i++) {
+                if ($i !~ /^[0-9]+$/ || $i > 255) exit 1
+              }
+            }
+          '; then
+            echo "Error: only IPv4 DNS servers are supported: $dns_server" >&2
+            exit 1
+          fi
+          if [ "$dns_rule_index" -gt 8 ]; then
+            echo 'Error: at most 8 DNS servers are supported.' >&2
+            exit 1
+          fi
+          dns_rule="wgclient_dns_$dns_rule_index"
+          uci set "network.$dns_rule=rule"
+          uci set "network.$dns_rule.dest=$dns_server/32"
+          uci set "network.$dns_rule.lookup={{ wg_route_table }}"
+          uci set "network.$dns_rule.priority=$(({{ wg_lan_rule_priority }} + dns_rule_index))"
+          dns_rule_index=$((dns_rule_index + 1))
+        done
+        IFS=$old_ifs
+
+        # WireGuard netifd does not publish interface DNS options. Configure
+        # dnsmasq directly so router and LAN queries use only the VPN resolver.
+        uci -q get 'dhcp.@dnsmasq[0]' >/dev/null || {
+          echo 'Error: dnsmasq UCI configuration is missing.' >&2
+          exit 1
+        }
+        uci set 'dhcp.@dnsmasq[0].noresolv=1'
+        uci -q delete 'dhcp.@dnsmasq[0].server' || true
+        add_comma_separated_list 'dhcp.@dnsmasq[0].server' "$dns_servers"
+
+        uci set firewall.{{ wg_firewall_zone }}='zone'
+        uci set firewall.{{ wg_firewall_zone }}.name='{{ wg_firewall_zone }}'
+        uci set firewall.{{ wg_firewall_zone }}.input='REJECT'
+        uci set firewall.{{ wg_firewall_zone }}.output='ACCEPT'
+        uci set firewall.{{ wg_firewall_zone }}.forward='REJECT'
+        uci set firewall.{{ wg_firewall_zone }}.masq='1'
+        uci set firewall.{{ wg_firewall_zone }}.mtu_fix='1'
+        uci -q delete firewall.{{ wg_firewall_zone }}.network || true
+        uci add_list firewall.{{ wg_firewall_zone }}.network='{{ wg_interface }}'
+
+        uci set firewall.{{ lan_to_wg_forwarding }}='forwarding'
+        uci set firewall.{{ lan_to_wg_forwarding }}.src='{{ lan_firewall_zone }}'
+        uci set firewall.{{ lan_to_wg_forwarding }}.dest='{{ wg_firewall_zone }}'
+
+        # Remove every LAN-to-WAN forwarding as a VPN leak-prevention switch.
+        while :; do
+          forwarding_to_delete=''
+          for forwarding in $(uci -q show firewall | sed -n 's/^firewall\.\([^=]*\)=forwarding$/\1/p'); do
+            source_zone="$(uci -q get "firewall.$forwarding.src" || true)"
+            destination_zone="$(uci -q get "firewall.$forwarding.dest" || true)"
+            if [ "$source_zone" = '{{ lan_firewall_zone }}' ] && \
+               [ "$destination_zone" = '{{ wan_firewall_zone }}' ]; then
+              forwarding_to_delete=$forwarding
+              break
+            fi
+          done
+          [ -n "$forwarding_to_delete" ] || break
+          uci -q delete "firewall.$forwarding_to_delete"
+        done
+
+        uci commit network
+        uci commit firewall
+        uci commit dhcp
+
+        # Reload only the WireGuard interface. Reloading the complete network
+        # can reset WAN and terminate the SSH session running this playbook.
+        ifdown '{{ wg_interface }}' >/dev/null 2>&1 || true
+        ifup '{{ wg_interface }}'
+
+        wg_device=''
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+          wg_device="$({
+            ubus call network.interface.{{ wg_interface }} status 2>/dev/null || true
+          } | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
+          [ -n "$wg_device" ] && break
+          sleep 1
+        done
+        if [ -z "$wg_device" ]; then
+          echo 'Error: the WireGuard interface did not become ready.' >&2
+          exit 1
+        fi
+
+        lan_device="$({
+          ubus call network.interface.{{ lan_interface }} status 2>/dev/null || true
+        } | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
+        if [ -z "$lan_device" ]; then
+          echo 'Error: cannot determine the LAN device for policy routing.' >&2
+          exit 1
+        fi
+
+        ip -4 route replace default dev "$wg_device" table '{{ wg_route_table }}'
+        while ip -4 rule delete priority '{{ wg_lan_rule_priority }}' 2>/dev/null; do :; done
+        ip -4 rule add priority '{{ wg_lan_rule_priority }}' \
+          iif "$lan_device" lookup '{{ wg_route_table }}'
+
+        dns_rule_index=1
+        while [ "$dns_rule_index" -le 8 ]; do
+          dns_priority=$(({{ wg_lan_rule_priority }} + dns_rule_index))
+          while ip -4 rule delete priority "$dns_priority" 2>/dev/null; do :; done
+          dns_rule_index=$((dns_rule_index + 1))
+        done
+
+        dns_rule_index=1
+        old_ifs=$IFS
+        IFS=,
+        for dns_server in $dns_servers; do
+          dns_server="$(trim_value "$dns_server")"
+          dns_priority=$(({{ wg_lan_rule_priority }} + dns_rule_index))
+          ip -4 rule add priority "$dns_priority" \
+            to "$dns_server/32" lookup '{{ wg_route_table }}'
+          dns_rule_index=$((dns_rule_index + 1))
+        done
+        IFS=$old_ifs
+
+        /etc/init.d/firewall reload
+        /etc/init.d/dnsmasq restart
+        sync
+      no_log: true
+      changed_when: true
+
+    - name: Report the configured gateway mode
+      ansible.builtin.debug:
+        msg: >-
+          OpenWrt is configured as a WireGuard client gateway on interface
+          {{ wg_interface }}; LAN forwarding is restricted to the
+          {{ wg_firewall_zone }} firewall zone.
