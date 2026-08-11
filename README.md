@@ -35,6 +35,27 @@ Build a WireGuard client appliance:
   --keys-dir client-keys
 ```
 
+Build a WireGuard relay appliance. The relay accepts downstream WireGuard
+clients and sends their traffic through the upstream tunnel described by the
+wg-quick configuration:
+
+```bash
+./build-openwrt-wireguard-relay.sh \
+  --ova output/openwrt-wireguard-relay.ova \
+  --keys-dir relay-keys \
+  --wg-quick-config clients/relay-upstream.conf
+```
+
+The relay OVA has one physical network adapter. Its `relay` interface uses the
+static address `10.8.7.4/20`; it has no LAN or WAN logical interfaces or
+firewall zones. IPv4 DHCP, DHCPv6, router advertisements, and NDP proxying are
+explicitly disabled on the `relay` interface. Separate `wgserver` and
+`wgclient` interfaces provide the downstream and upstream tunnels. The
+upstream configuration must be an IPv4 full-tunnel configuration with
+`0.0.0.0/0` in `AllowedIPs` and at least one IPv4 DNS server. Like the server
+build, the downstream WireGuard address comes from the `wg_address` default in
+`playbooks/configure-wireguard-server.yml`.
+
 ## Configure the Ansible Environment
 
 ### Install Ansible with `configure-ansible.sh`
@@ -167,6 +188,18 @@ A typical invocation is:
   -e wg_client_name=xianzi_lu
 ```
 
+When creating a client configuration on a relay image, explicitly select its
+`relay` logical interface. A relay has no `lan` interface, so omitting this
+option prevents the playbook from discovering the WireGuard endpoint address:
+
+```bash
+./run-ansible.sh \
+  --inventory inventory.ini \
+  playbooks/create-wireguard-client.yml \
+  -e wg_client_name=xianzi_lu \
+  -e lan_interface=relay
+```
+
 This example writes `clients/xianzi_lu.conf`. A client name cannot be created
 twice; use a new `wg_client_name` when running the playbook again.
 
@@ -191,7 +224,7 @@ Supported Ansible variables:
 | `wg_interface` | `wgserver` | No | Name of the server's WireGuard UCI interface. It must match the interface configured on the server. |
 | `wg_port` | `51820` | No | Server UDP port written to the client configuration. It must match the server's listening port. |
 | `wg_client_name` | `client1` | No | Client name used for the server-side peer section and default output filename. It may contain only letters, digits, underscores, and hyphens. Setting it explicitly is recommended. |
-| `lan_interface` | `lan` | No | Logical OpenWrt interface from which the playbook discovers the server's WireGuard endpoint address. |
+| `lan_interface` | `lan` | No | Logical OpenWrt interface from which the playbook discovers the server's WireGuard endpoint address. Set it to `relay` when the target is a relay image. |
 | `wg_client_dns` | `10.20.0.1` | No | DNS server written to the client's `[Interface]` section. It cannot be empty and should be reachable through the tunnel. |
 | `wg_client_allowed_ips` | `0.0.0.0/0` | No | Value written to `AllowedIPs` in the client's `[Peer]` section. The default enables an IPv4 full tunnel; override it with the required networks for split tunneling. |
 | `wg_client_config_file` | `clients/<wg_client_name>.conf` | No | Output path on the Ansible controller. The default path is under the project root; an absolute path may also be supplied. |

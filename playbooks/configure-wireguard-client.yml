@@ -309,13 +309,17 @@
         uci commit firewall
         uci commit dhcp
 
-        # Reload only the WireGuard interface. Reloading the complete network
-        # can reset WAN and terminate the SSH session running this playbook.
+        # A newly created UCI interface is not necessarily registered with
+        # netifd yet, so ifup alone can return before the interface exists.
+        # Reload the netifd configuration; unchanged physical interfaces remain
+        # in place while the new WireGuard interface is registered and started.
         ifdown '{{ wg_interface }}' >/dev/null 2>&1 || true
-        ifup '{{ wg_interface }}'
+        ubus call network reload >/dev/null
 
         wg_device=''
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
+        wg_attempt=0
+        while [ "$wg_attempt" -lt 30 ]; do
+          wg_attempt=$((wg_attempt + 1))
           wg_device="$({
             ubus call network.interface.{{ wg_interface }} status 2>/dev/null || true
           } | jsonfilter -e '@.l3_device' 2>/dev/null || true)"

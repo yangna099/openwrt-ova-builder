@@ -40,6 +40,13 @@
       register: wireguard_install
       changed_when: "'changed: WireGuard packages installed' in wireguard_install.stdout"
 
+    - name: Restart netifd after installing the WireGuard protocol handler
+      ansible.builtin.raw: |
+        set -eu
+        /etc/init.d/network restart
+      when: wireguard_install.changed
+      changed_when: true
+
     - name: Reload LuCI after installing its WireGuard protocol module
       ansible.builtin.raw: |
         rm -f /tmp/luci-indexcache*

@@ -183,7 +183,8 @@ qemu_pid=$!
 
 echo "Waiting up to ${boot_timeout}s for OpenWrt SSH..."
 ready=0
-for (( elapsed = 0; elapsed < 10#$boot_timeout; elapsed += 2 )); do
+boot_deadline=$((SECONDS + 10#$boot_timeout))
+while ((SECONDS < boot_deadline)); do
     if ! kill -0 "$qemu_pid" 2>/dev/null; then
         echo "Error: QEMU stopped during boot. See: $qemu_log" >&2
         exit 1
@@ -194,7 +195,9 @@ for (( elapsed = 0; elapsed < 10#$boot_timeout; elapsed += 2 )); do
         ready=1
         break
     fi
-    sleep 2
+    remaining=$((boot_deadline - SECONDS))
+    ((remaining > 0)) || break
+    ((remaining < 2)) && sleep "$remaining" || sleep 2
 done
 (( ready == 1 )) || { echo "Error: OpenWrt SSH did not become ready. See: $qemu_log" >&2; exit 1; }
 

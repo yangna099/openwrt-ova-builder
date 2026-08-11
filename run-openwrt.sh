@@ -11,6 +11,8 @@ fi
 image="$1"
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly network_file="${OPENWRT_NETWORK_CONFIG:-${script_dir}/network.conf}"
+readonly network_mode="${OPENWRT_NETWORK_MODE:-dual}"
+readonly network_interface="${OPENWRT_NETWORK_INTERFACE:-lan}"
 readonly memory="${QEMU_MEMORY:-512M}"
 readonly cpus="${QEMU_CPUS:-2}"
 readonly luci_port="${OPENWRT_LUCI_PORT:-8080}"
@@ -36,15 +38,15 @@ if [[ ! -f "$network_file" ]]; then
     exit 1
 fi
 
-get_lan_option() {
-    awk -v wanted="$1" '
+get_interface_option() {
+    awk -v wanted_interface="$1" -v wanted_option="$2" '
         $1 == "config" && $2 == "interface" {
             interface = $3
             gsub(/^['\''"]|['\''"]$/, "", interface)
-            in_lan = (interface == "lan")
+            in_wanted_interface = (interface == wanted_interface)
             next
         }
-        in_lan && $1 == "option" && $2 == wanted {
+        in_wanted_interface && $1 == "option" && $2 == wanted_option {
             value = $3
             gsub(/^['\''"]|['\''"]$/, "", value)
             print value
@@ -97,24 +99,38 @@ netmask_prefix() {
     printf '%d\n' "$prefix"
 }
 
-lan_ip="$(get_lan_option ipaddr)"
-lan_netmask="$(get_lan_option netmask)"
-if [[ -z "$lan_ip" || -z "$lan_netmask" ]]; then
-    echo "Error: LAN ipaddr or netmask is missing from: $network_file" >&2
+case "$network_mode" in
+    dual|single) ;;
+    *)
+        echo "Error: OPENWRT_NETWORK_MODE must be 'dual' or 'single': $network_mode" >&2
+        exit 1
+        ;;
+esac
+
+interface_ip="$(get_interface_option "$network_interface" ipaddr)"
+interface_netmask="$(get_interface_option "$network_interface" netmask)"
+interface_gateway="$(get_interface_option "$network_interface" gateway)"
+if [[ -z "$interface_ip" || -z "$interface_netmask" ]]; then
+    echo "Error: ${network_interface} ipaddr or netmask is missing from: $network_file" >&2
     exit 1
 fi
 
-if ! lan_ip_int="$(ipv4_to_int "$lan_ip")" || ! lan_mask_int="$(ipv4_to_int "$lan_netmask")"; then
-    echo "Error: invalid LAN IPv4 address or netmask in: $network_file" >&2
+if ! interface_ip_int="$(ipv4_to_int "$interface_ip")" || \
+    ! interface_mask_int="$(ipv4_to_int "$interface_netmask")"; then
+    echo "Error: invalid ${network_interface} IPv4 address or netmask in: $network_file" >&2
     exit 1
 fi
 
-if ! lan_prefix="$(netmask_prefix "$lan_mask_int")"; then
-    echo "Error: LAN netmask is not contiguous: $lan_netmask" >&2
+if ! interface_prefix="$(netmask_prefix "$interface_mask_int")"; then
+    echo "Error: ${network_interface} netmask is not contiguous: $interface_netmask" >&2
     exit 1
 fi
 
-lan_network="$(int_to_ipv4 "$((lan_ip_int & lan_mask_int))")/${lan_prefix}"
+interface_network="$(int_to_ipv4 "$((interface_ip_int & interface_mask_int))")/${interface_prefix}"
+if [[ -n "$interface_gateway" ]] && ! ipv4_to_int "$interface_gateway" >/dev/null; then
+    echo "Error: invalid ${network_interface} gateway in: $network_file" >&2
+    exit 1
+fi
 
 ovmf_code=''
 ovmf_vars_template=''
@@ -150,6 +166,24 @@ The QEMU serial console is attached to this terminal.  Press Ctrl+A, then X
 to quit QEMU.
 MESSAGE
 
+if [[ "$network_mode" == 'single' ]]; then
+    netdev="user,id=network,net=${interface_network}"
+    [[ -z "$interface_gateway" ]] || netdev+=",host=${interface_gateway}"
+    netdev+=",hostfwd=tcp:127.0.0.1:${luci_port}-${interface_ip}:80"
+    netdev+=",hostfwd=tcp:127.0.0.1:${ssh_port}-${interface_ip}:22"
+    network_arguments=(
+        -netdev "$netdev"
+        -device virtio-net-pci,netdev=network,mac=52:54:00:00:00:10
+    )
+else
+    network_arguments=(
+        -netdev user,id=wan
+        -device virtio-net-pci,netdev=wan,mac=52:54:00:00:00:10
+        -netdev "user,id=lan,net=${interface_network},hostfwd=tcp:127.0.0.1:${luci_port}-${interface_ip}:80,hostfwd=tcp:127.0.0.1:${ssh_port}-${interface_ip}:22"
+        -device virtio-net-pci,netdev=lan,mac=52:54:00:00:00:11
+    )
+fi
+
 exec qemu-system-x86_64 \
     -name openwrt \
     -machine q35,accel=kvm:tcg \
@@ -161,8 +195,6 @@ exec qemu-system-x86_64 \
     -serial stdio \
     -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
     -drive if=pflash,format=raw,file="$ovmf_vars" \
-    -drive file="$image",if=virtio,format=qcow2 \
-    -netdev user,id=wan \
-    -device virtio-net-pci,netdev=wan,mac=52:54:00:00:00:10 \
-    -netdev user,id=lan,net=${lan_network},hostfwd=tcp:127.0.0.1:${luci_port}-${lan_ip}:80,hostfwd=tcp:127.0.0.1:${ssh_port}-${lan_ip}:22 \
-    -device virtio-net-pci,netdev=lan,mac=52:54:00:00:00:11
+    -drive file="$image",if=none,id=openwrt_disk,format=qcow2 \
+    -device virtio-blk-pci,drive=openwrt_disk,bootindex=1 \
+    "${network_arguments[@]}"
