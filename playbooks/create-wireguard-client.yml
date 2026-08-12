@@ -183,10 +183,34 @@
         uci add_list "network.$peer_section.allowed_ips=$client_address"
         uci set "network.$peer_section.route_allowed_ips=0"
         uci commit network
-        # `network reload` can leave an already-running WireGuard interface
-        # unchanged, so the new UCI peer never reaches the kernel interface.
-        ifdown '{{ wg_interface }}' || true
-        ifup '{{ wg_interface }}'
+
+        # Persist the peer in UCI above, then also add it directly to the
+        # running kernel interface. Restarting the interface immediately after
+        # an asynchronous ifdown can race with netifd and leave the new peer
+        # inactive until a later manual ifdown/ifup.
+        if wg show '{{ wg_interface }}' >/dev/null 2>&1; then
+          wg set '{{ wg_interface }}' \
+            peer "$client_public_key" \
+            allowed-ips "$client_address"
+        else
+          ifup '{{ wg_interface }}'
+        fi
+
+        peer_loaded='0'
+        peer_load_attempt=0
+        while [ "$peer_load_attempt" -lt 30 ]; do
+          peer_load_attempt=$((peer_load_attempt + 1))
+          if wg show '{{ wg_interface }}' peers 2>/dev/null | \
+              grep -Fxq "$client_public_key"; then
+            peer_loaded='1'
+            break
+          fi
+          sleep 1
+        done
+        if [ "$peer_loaded" != '1' ]; then
+          echo 'Error: the new WireGuard peer was saved but not loaded into the running interface.' >&2
+          exit 1
+        fi
 
         cat <<EOF
         [Interface]
