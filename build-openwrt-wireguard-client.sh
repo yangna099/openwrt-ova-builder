@@ -5,7 +5,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./build-openwrt-wireguard-client.sh --ova FILE [options]
+Usage: ./build-openwrt-wireguard-client.sh --ova FILE --wg-quick-config FILE [options]
 
 Build steps:
   1. Download the OpenWrt x86-64 EFI image.
@@ -13,12 +13,14 @@ Build steps:
   3. Configure the root password, SSH key, and network.
   4. Boot QEMU and wait for SSH.
   5. Install WireGuard with LuCI support.
-  6. Expose the OpenWrt SSH and HTTP ports on WAN.
-  7. Shut down OpenWrt cleanly.
-  8. Convert the final disk to VMDK and package FILE as an OVA.
+  6. Apply the supplied wg-quick configuration to the WireGuard client.
+  7. Expose the OpenWrt SSH and HTTP ports on WAN.
+  8. Shut down OpenWrt cleanly.
+  9. Convert the final disk to VMDK and package FILE as an OVA.
 
 Options:
   --ova FILE               Required OVA output path.
+  --wg-quick-config FILE   Required WireGuard client wg-quick configuration.
   --disk-dir DIR           Image working directory (default: disk)
   --keys-dir DIR           SSH key directory (default: keys)
   --network FILE           OpenWrt network UCI file (default: networks/client.conf)
@@ -27,9 +29,10 @@ Options:
   --boot-timeout SEC       Seconds to wait for OpenWrt SSH (default: 180)
   -h, --help               Show this help message
 
-Existing downloaded images, QCOW2 disks, generated SSH keys, and the requested
-OVA are replaced. Use separate --disk-dir and --keys-dir values to preserve
-working files from another build.
+The client configuration must contain one peer, IPv4 DNS servers, and
+0.0.0.0/0 in AllowedIPs. Existing downloaded images, QCOW2 disks, generated
+SSH keys, and the requested OVA are replaced. Use separate --disk-dir and
+--keys-dir values to preserve working files from another build.
 EOF
 }
 
@@ -44,13 +47,16 @@ boot_timeout='180'
 qemu_pid=''
 work_dir=''
 user_configuration_output=''
+wg_quick_config_file=''
+extra_vars_file=''
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --ova|--disk-dir|--keys-dir|--network|--ssh-port|--luci-port|--boot-timeout)
+        --ova|--wg-quick-config|--disk-dir|--keys-dir|--network|--ssh-port|--luci-port|--boot-timeout)
             [[ $# -ge 2 ]] || { echo "Error: $1 requires a value." >&2; exit 1; }
             case "$1" in
                 --ova) ova_file="$2" ;;
+                --wg-quick-config) wg_quick_config_file="$2" ;;
                 --disk-dir) disk_dir="$2" ;;
                 --keys-dir) keys_dir="$2" ;;
                 --network) network_file="$2" ;;
@@ -73,6 +79,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$ova_file" ]] || { echo 'Error: --ova is required.' >&2; usage >&2; exit 1; }
+[[ -n "$wg_quick_config_file" ]] || {
+    echo 'Error: --wg-quick-config is required.' >&2
+    usage >&2
+    exit 1
+}
 for value in "$ssh_port" "$luci_port" "$boot_timeout"; do
     [[ "$value" =~ ^[0-9]+$ ]] && ((10#$value > 0)) || {
         echo "Error: expected a positive integer, got: $value" >&2
@@ -132,6 +143,7 @@ wait_for_qemu_shutdown() {
 cleanup() {
     stop_qemu
     [[ -z "$work_dir" ]] || rm -rf -- "$work_dir"
+    [[ -z "$extra_vars_file" ]] || rm -f -- "$extra_vars_file"
 }
 trap cleanup EXIT INT TERM
 
@@ -143,12 +155,22 @@ disk_dir="$(realpath -m "$disk_dir")"
 keys_dir="$(realpath -m "$keys_dir")"
 network_file="$(realpath -m "$network_file")"
 ova_file="$(realpath -m "$ova_file")"
+wg_quick_config_file="$(realpath -m "$wg_quick_config_file")"
 
 [[ -f "$network_file" ]] || { echo "Error: network config does not exist: $network_file" >&2; exit 1; }
+[[ -f "$wg_quick_config_file" ]] || {
+    echo "Error: wg-quick config does not exist: $wg_quick_config_file" >&2
+    exit 1
+}
+if [[ "$wg_quick_config_file" == *$'\n'* || "$wg_quick_config_file" == *$'\r'* ]]; then
+    echo 'Error: the wg-quick config path cannot contain a newline.' >&2
+    exit 1
+fi
 for required_file in \
     download-openwrt-efi.sh prepare-image.sh configure-user.sh configure-network.sh \
     configure-ansible.sh configure-inventory.sh run-openwrt.sh run-ansible.sh \
-    playbooks/install-wireguard.yml playbooks/expose-ssh-http-port-on-wan.yml \
+    playbooks/install-wireguard.yml playbooks/configure-wireguard-client.yml \
+    playbooks/expose-ssh-http-port-on-wan.yml \
     playbooks/shutdown-openwrt.yml; do
     [[ -f "${project_dir}/${required_file}" ]] || {
         echo "Error: required project file does not exist: ${project_dir}/${required_file}" >&2
@@ -157,6 +179,13 @@ for required_file in \
 done
 
 mkdir -p "$disk_dir" "$keys_dir" "$(dirname "$ova_file")"
+
+# Ansible's key=value extra-vars syntax splits values containing spaces.
+# Pass the path through a small JSON file so every valid ordinary path works.
+escaped_wg_quick_config_file=${wg_quick_config_file//\\/\\\\}
+escaped_wg_quick_config_file=${escaped_wg_quick_config_file//\"/\\\"}
+extra_vars_file="$(mktemp "${disk_dir}/.extra-vars.XXXXXX.json")"
+printf '{"wg_quick_config_file":"%s"}\n' "$escaped_wg_quick_config_file" >"$extra_vars_file"
 
 version="$(awk -F"'" '/^readonly VERSION=/{print $2; exit}' "${project_dir}/download-openwrt-efi.sh")"
 target="$(awk -F"'" '/^readonly TARGET=/{print $2; exit}' "${project_dir}/download-openwrt-efi.sh")"
@@ -222,6 +251,11 @@ echo '==> Preparing Ansible and creating the inventory'
 
 echo '==> Installing WireGuard and LuCI support'
 "${project_dir}/run-ansible.sh" "${project_dir}/playbooks/install-wireguard.yml"
+
+echo '==> Configuring the WireGuard client gateway'
+"${project_dir}/run-ansible.sh" \
+    "${project_dir}/playbooks/configure-wireguard-client.yml" \
+    -e "@${extra_vars_file}"
 
 echo '==> Exposing the OpenWrt SSH and HTTP ports on WAN'
 "${project_dir}/run-ansible.sh" "${project_dir}/playbooks/expose-ssh-http-port-on-wan.yml"
