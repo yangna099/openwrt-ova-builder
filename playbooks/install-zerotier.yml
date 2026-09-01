@@ -1,0 +1,84 @@
+---
+- name: Install ZeroTier and prepare the OpenWrt appliance
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    zerotier_packages:
+      - zerotier
+      - ip-full
+      - jsonfilter
+
+  tasks:
+    - name: Install ZeroTier and runtime dependencies
+      ansible.builtin.raw: |
+        set -eu
+        packages='{{ zerotier_packages | join(" ") }}'
+        missing=''
+
+        if command -v apk >/dev/null 2>&1; then
+          for package in $packages; do
+            apk info -e "$package" >/dev/null 2>&1 || missing="$missing $package"
+          done
+          if [ -n "$missing" ]; then
+            apk update
+            apk add $missing
+            echo 'changed: ZeroTier packages installed'
+          fi
+        elif command -v opkg >/dev/null 2>&1; then
+          for package in $packages; do
+            opkg list-installed "$package" | grep -q "^$package " || missing="$missing $package"
+          done
+          if [ -n "$missing" ]; then
+            opkg update
+            opkg install $missing
+            echo 'changed: ZeroTier packages installed'
+          fi
+        else
+          echo 'Error: neither apk nor opkg is available.' >&2
+          exit 1
+        fi
+      register: zerotier_install
+      changed_when: "'changed: ZeroTier packages installed' in zerotier_install.stdout"
+
+    - name: Embed the eth2 management network and disable IPv6
+      ansible.builtin.raw: |
+        set -eu
+
+        uci set network.wan_internal='interface'
+        uci set network.wan_internal.device='eth2'
+        uci set network.wan_internal.proto='dhcp'
+        uci -q delete network.lan.ip6assign || true
+        uci -q delete network.wan6 || true
+        uci commit network
+
+        uci set firewall.internal='zone'
+        uci set firewall.internal.name='internal'
+        uci set firewall.internal.input='ACCEPT'
+        uci set firewall.internal.output='ACCEPT'
+        uci set firewall.internal.forward='ACCEPT'
+        uci -q delete firewall.internal.network || true
+        uci add_list firewall.internal.network='wan_internal'
+        uci commit firewall
+        /etc/init.d/firewall restart
+
+        mkdir -p /etc/sysctl.d
+        cat > /etc/sysctl.d/99-disable-ipv6.conf <<'SYSCTL_EOF'
+        net.ipv6.conf.all.disable_ipv6=1
+        net.ipv6.conf.default.disable_ipv6=1
+        net.ipv6.conf.lo.disable_ipv6=1
+        SYSCTL_EOF
+        sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
+        sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+        sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null
+      changed_when: true
+
+    - name: Show installed ZeroTier package status
+      ansible.builtin.raw: |
+        if command -v apk >/dev/null 2>&1; then
+          apk info {{ zerotier_packages | join(' ') }}
+        else
+          opkg list-installed {{ zerotier_packages | join(' ') }}
+        fi
+      changed_when: false
+
