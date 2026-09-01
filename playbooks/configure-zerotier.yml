@@ -4,8 +4,6 @@
   gather_facts: false
 
   vars:
-    zerotier_network_id: 49c443bf9a4a99dd
-    zerotier_exit_ip: 10.121.15.247
     zerotier_interface: zerotier
     zerotier_device: ''
     zerotier_default_route: zt_default
@@ -20,8 +18,8 @@
     - name: Validate ZeroTier parameters
       ansible.builtin.assert:
         that:
-          - zerotier_network_id | string is match('^[0-9A-Fa-f]{16}$')
-          - zerotier_exit_ip | string is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+          - (zerotier_network_id | default('') | string) is match('^[0-9A-Fa-f]{16}$')
+          - (zerotier_exit_ip | default('') | string) is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
           - zerotier_interface | string is match('^[A-Za-z0-9_]+$')
           - zerotier_device | string | length == 0 or zerotier_device | string is match('^[A-Za-z0-9_.-]+$')
           - zerotier_default_route | string is match('^[A-Za-z0-9_]+$')
@@ -31,7 +29,9 @@
           - zerotier_authorization_timeout | int > 0
           - zerotier_poll_interval | int > 0
           - zerotier_restart_delay | int > 0
-        fail_msg: Check the ZeroTier IDs, addresses, names, metrics, and wait settings.
+        fail_msg: >-
+          zerotier_network_id and zerotier_exit_ip are required extra
+          variables. Check their formats and the remaining ZeroTier settings.
 
   tasks:
     - name: Keep the appliance IPv4-only

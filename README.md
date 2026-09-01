@@ -195,6 +195,9 @@ Point `inventory.ini` at the DHCP address obtained by `eth2`, then run:
   }'
 ```
 
+`zerotier_network_id` and `zerotier_exit_ip` have no defaults and must be
+provided for every run.
+
 The playbook prints the ZeroTier node ID and waits up to 600 seconds for
 controller authorization. It requires the selected network to report `OK`,
 requires an assigned IPv4 CIDR in `zerotier-cli -j listnetworks`, and verifies
