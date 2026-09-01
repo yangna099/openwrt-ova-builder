@@ -57,6 +57,7 @@
     - name: Keep PBR disabled until its policies are configured
       ansible.builtin.raw: |
         set -eu
+        uci -q get pbr.config >/dev/null 2>&1 || uci set pbr.config='pbr'
         uci set pbr.config.enabled='0'
         uci commit pbr
         /etc/init.d/pbr disable

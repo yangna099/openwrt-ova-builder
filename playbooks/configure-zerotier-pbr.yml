@@ -12,6 +12,7 @@
     lan_source_subnet: 10.10.11.0/24
     domestic_expected_address_prefix: 10.8.8.
     domestic_expected_prefix_length: 20
+    domestic_route_metric: 500
     internal_route_metric: 10
     internal_ping_attempts: 5
     china_list_url: https://china-operator-ip.yfgao.com/china.txt
@@ -31,6 +32,8 @@
           - domestic_expected_address_prefix | string is match('^[0-9]+\.[0-9]+\.[0-9]+\.$')
           - domestic_expected_prefix_length | int >= 1
           - domestic_expected_prefix_length | int <= 32
+          - (domestic_gateway | default('') | string) is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+          - domestic_route_metric | int > 0
           - (internal_route_target | default('') | string) is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/32$')
           - internal_route_metric | int > 0
           - internal_ping_attempts | int > 0
@@ -38,8 +41,9 @@
           - china_list_min_prefixes | int > 0
           - (china_list_max_prefixes | int) >= (china_list_min_prefixes | int)
         fail_msg: >-
-          internal_route_target is a required /32 extra variable. Check it,
-          the PBR interface names, IPv4/CIDR values, URL, and numeric limits.
+          domestic_gateway and internal_route_target are required extra
+          variables. Check their IPv4/CIDR formats, the PBR interface names,
+          URL, and numeric limits.
 
     - name: Require authorized ZeroTier and the existing eth2 management path
       ansible.builtin.raw: |
@@ -97,8 +101,8 @@
           echo "Error: expected eth2 prefix /{{ domestic_expected_prefix_length | int }}, received $domestic_cidr." >&2
           exit 1
         }
-        ip -4 route show default dev {{ domestic_device | quote }} | grep -q . || {
-          echo 'Error: eth2 has no DHCP default route for China Internet traffic.' >&2
+        ip -4 route get {{ domestic_gateway | quote }} | grep -Fq 'dev {{ domestic_device }}' || {
+          echo 'Error: domestic_gateway is not directly reachable through eth2.' >&2
           exit 1
         }
       changed_when: false
@@ -107,6 +111,26 @@
     - name: Preserve eth2 management access and enable LAN forwarding through it
       ansible.builtin.raw: |
         set -eu
+
+        # Keep eth0 as the normal main-table default. The high-metric eth2
+        # route supplies a gateway to PBR without renewing or restarting DHCP.
+        uci set network.{{ domestic_interface }}.defaultroute='0'
+        uci set network.{{ domestic_interface }}.peerdns='0'
+        uci set network.{{ domestic_interface }}.metric='{{ domestic_route_metric | int }}'
+        uci set network.pbr_domestic_default='route'
+        uci set network.pbr_domestic_default.interface='{{ domestic_interface }}'
+        uci set network.pbr_domestic_default.target='0.0.0.0/0'
+        uci set network.pbr_domestic_default.gateway={{ domestic_gateway | quote }}
+        uci set network.pbr_domestic_default.metric='{{ domestic_route_metric | int }}'
+        uci commit network
+        ip -4 route replace default via {{ domestic_gateway | quote }} \
+          dev {{ domestic_device | quote }} metric {{ domestic_route_metric | int }}
+
+        ip -4 route show default dev {{ domestic_device | quote }} | \
+          grep -Fq 'via {{ domestic_gateway }}' || {
+          echo 'Error: failed to install the high-metric eth2 default route.' >&2
+          exit 1
+        }
 
         # Keep one canonical zone name so fw4 cannot emit duplicate symbols.
         for section in $(uci -q -X show firewall | sed -n 's/^firewall\.\([^.=]*\)=zone$/\1/p'); do
@@ -315,6 +339,7 @@
         UPDATE_SCRIPT
         chmod 0755 /usr/sbin/pbr_china4_zerotier.sh
 
+        uci -q get pbr.config >/dev/null 2>&1 || uci set pbr.config='pbr'
         uci set pbr.config.enabled='1'
         uci set pbr.config.strict_enforcement='1'
         uci set pbr.config.ipv6_enabled='0'
