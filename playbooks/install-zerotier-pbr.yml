@@ -1,0 +1,82 @@
+---
+- name: Install PBR for the configured OpenWrt ZeroTier gateway
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    zerotier_pbr_packages:
+      - pbr
+      - luci-app-pbr
+      - ca-bundle
+      - resolveip
+      - uclient-fetch
+
+  tasks:
+    - name: Require the first-stage ZeroTier installation
+      ansible.builtin.raw: |
+        set -eu
+        for command in zerotier-cli uci ip; do
+          command -v "$command" >/dev/null 2>&1 || {
+            echo "Error: $command is missing; complete the first-stage OVA build first." >&2
+            exit 1
+          }
+        done
+      changed_when: false
+
+    - name: Install PBR, LuCI integration, and runtime dependencies
+      ansible.builtin.raw: |
+        set -eu
+        packages='{{ zerotier_pbr_packages | join(" ") }}'
+        missing=''
+
+        if command -v apk >/dev/null 2>&1; then
+          for package in $packages; do
+            apk info -e "$package" >/dev/null 2>&1 || missing="$missing $package"
+          done
+          if [ -n "$missing" ]; then
+            apk update
+            apk add $missing
+            echo 'changed: ZeroTier PBR packages installed'
+          fi
+        elif command -v opkg >/dev/null 2>&1; then
+          for package in $packages; do
+            opkg list-installed "$package" | grep -q "^$package " || missing="$missing $package"
+          done
+          if [ -n "$missing" ]; then
+            opkg update
+            opkg install $missing
+            echo 'changed: ZeroTier PBR packages installed'
+          fi
+        else
+          echo 'Error: neither apk nor opkg is available.' >&2
+          exit 1
+        fi
+      register: zerotier_pbr_install
+      changed_when: "'changed: ZeroTier PBR packages installed' in zerotier_pbr_install.stdout"
+
+    - name: Keep PBR disabled until its policies are configured
+      ansible.builtin.raw: |
+        set -eu
+        uci set pbr.config.enabled='0'
+        uci commit pbr
+        /etc/init.d/pbr disable
+        /etc/init.d/pbr stop >/dev/null 2>&1 || true
+      changed_when: false
+
+    - name: Reload LuCI after installing PBR
+      ansible.builtin.raw: |
+        rm -f /tmp/luci-indexcache*
+        rm -rf /tmp/luci-modulecache
+        killall -HUP rpcd 2>/dev/null || true
+        /etc/init.d/uhttpd reload
+      when: zerotier_pbr_install.changed
+      changed_when: false
+
+    - name: Show installed PBR package status
+      ansible.builtin.raw: |
+        if command -v apk >/dev/null 2>&1; then
+          apk info {{ zerotier_pbr_packages | join(' ') }}
+        else
+          opkg list-installed {{ zerotier_pbr_packages | join(' ') }}
+        fi
+      changed_when: false
