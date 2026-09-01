@@ -227,6 +227,7 @@ Then configure routing and the China IPv4 list:
   playbooks/configure-zerotier-pbr.yml \
   -e '{
     "lan_source_subnet": "10.10.11.0/24",
+    "domestic_gateway": "<ETH2_GATEWAY>",
     "internal_route_target": "<INTERNAL_ROUTE_TARGET_CIDR>"
   }'
 ```
@@ -236,10 +237,12 @@ China IPv4 destinations are added to the PBR destination set for
 `10.10.11.0/24` is added to the ZeroTier source set. Local and reserved
 destinations are ignored by PBR. The playbook preserves `input=ACCEPT` on the
 existing `internal` firewall zone, enables masquerading and `lan → internal`
-forwarding, and installs a persistent and immediate host route to
-the supplied `/32` target through `eth2`. It deliberately avoids `ifup`,
-`ifdown`, and network-service reloads so the Ansible connection through
-`eth2` remains up.
+forwarding, and installs a persistent metric-500 default route through the
+supplied eth2 gateway for PBR. The ordinary main-table default remains on
+eth0 because it has a lower metric. A persistent and immediate host route to
+the supplied `/32` target is also installed through `eth2`. The playbook
+deliberately avoids `ifup`, `ifdown`, and network-service reloads so the
+Ansible connection through `eth2` remains up.
 
 The generated files are `/etc/pbr.d/10-china-zerotier` and
 `/usr/sbin/pbr_china4_zerotier.sh`. The updater downloads and validates the
@@ -254,6 +257,8 @@ Important second-stage variables:
 | `domestic_interface` | `wan_internal` | Existing DHCP interface used for China traffic. |
 | `domestic_device` | `eth2` | Existing management NIC; no new NIC is created. |
 | `domestic_firewall_zone` | `internal` | Existing management firewall zone retained by the playbook. |
+| `domestic_gateway` | Required | IPv4 next hop used by China traffic through eth2. |
+| `domestic_route_metric` | `500` | Metric of the backup main-table default route through eth2. |
 | `internal_route_target` | Required | `/32` host route installed through eth2. |
 | `china_list_url` | `https://china-operator-ip.yfgao.com/china.txt` | China IPv4 prefix source. |
 | `china_list_min_prefixes` | `3000` | Minimum accepted list size. |
