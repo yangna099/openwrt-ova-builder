@@ -161,8 +161,8 @@ After creating the inventory, verify connectivity with a harmless raw command:
 
 ## Run Ansible Playbooks
 
-The two playbooks documented below create a WireGuard client configuration on
-the server and then apply that configuration to a client OpenWrt instance.
+The playbooks documented below configure the ZeroTier gateway and its optional
+second-stage PBR behavior, followed by the existing WireGuard workflows.
 
 `run-ansible.sh` supports the following operating-system environment variable:
 
@@ -206,6 +206,61 @@ controller and interface again. Route and firewall configuration is applied
 only after all checks succeed. After the OpenWrt network reload, the playbook
 verifies the interface IPv4 a second time. The restart delay can be overridden
 with `zerotier_restart_delay`.
+
+### Configure China/International PBR on Existing eth2
+
+Complete the ZeroTier playbook first. The second stage reuses the embedded
+`eth2` interface (`wan_internal`) and does not add or restart a NIC. Install
+PBR and its dependencies:
+
+```bash
+./run-ansible.sh \
+  --inventory inventory.ini \
+  playbooks/install-zerotier-pbr.yml
+```
+
+Then configure routing and the China IPv4 list:
+
+```bash
+./run-ansible.sh \
+  --inventory inventory.ini \
+  playbooks/configure-zerotier-pbr.yml \
+  -e lan_source_subnet="10.10.11.0/24" \
+  -e domestic_gateway="<ETH2_GATEWAY>" \
+  -e internal_route_target="<INTERNAL_ROUTE_TARGET_CIDR>"
+```
+
+China IPv4 destinations are added to the PBR destination set for
+`wan_internal`; remaining public IPv4 traffic sourced from
+`10.10.11.0/24` is added to the ZeroTier source set. Local and reserved
+destinations are ignored by PBR. The playbook preserves `input=ACCEPT` on the
+existing `internal` firewall zone, enables masquerading and `lan → internal`
+forwarding, and installs a persistent metric-500 default route through the
+supplied eth2 gateway for PBR. The ordinary main-table default remains on
+eth0 because it has a lower metric. A persistent and immediate host route to
+the supplied `/32` target is also installed through `eth2`. The playbook
+deliberately avoids `ifup`, `ifdown`, and network-service reloads so the
+Ansible connection through `eth2` remains up.
+
+The generated files are `/etc/pbr.d/10-china-zerotier` and
+`/usr/sbin/pbr_china4_zerotier.sh`. The updater downloads and validates the
+China IPv4 list, rolls back if PBR cannot recreate both nft sets, and runs
+daily at 04:17. Domain-specific routing is outside this stage.
+
+Important second-stage variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `lan_source_subnet` | `10.10.11.0/24` | LAN source routed through ZeroTier after domestic/local exceptions. |
+| `domestic_interface` | `wan_internal` | Existing DHCP interface used for China traffic. |
+| `domestic_device` | `eth2` | Existing management NIC; no new NIC is created. |
+| `domestic_firewall_zone` | `internal` | Existing management firewall zone retained by the playbook. |
+| `domestic_gateway` | Required | IPv4 next hop used by China traffic through eth2. |
+| `domestic_route_metric` | `500` | Metric of the backup main-table default route through eth2. |
+| `internal_route_target` | Required | `/32` host route installed through eth2. |
+| `china_list_url` | `https://china-operator-ip.yfgao.com/china.txt` | China IPv4 prefix source. |
+| `china_list_min_prefixes` | `3000` | Minimum accepted list size. |
+| `china_list_max_prefixes` | `10000` | Maximum accepted list size. |
 
 ### Create a WireGuard Client Configuration
 
