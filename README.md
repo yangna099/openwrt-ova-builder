@@ -35,6 +35,21 @@ Build a WireGuard client appliance:
   --keys-dir client-keys
 ```
 
+Build the ZeroTier appliance:
+
+```bash
+./build-openwrt-zerotier.sh \
+  --ova output/openwrt-zt-pbr.ova \
+  --disk-dir disk-zerotier \
+  --keys-dir zerotier-keys
+```
+
+The imported PVE virtual machine is named `openwrt-zt-pbr`. Its three embedded
+NICs are WAN `eth0`, LAN `eth1` at `10.10.11.1/24`, and Ansible management
+`eth2`. The `eth2` NIC is preconfigured as DHCP interface `wan_internal` in
+the `internal` firewall zone, so it can be used before the post-import
+ZeroTier playbook runs. The appliance is configured as IPv4-only.
+
 Build a WireGuard relay appliance. The relay accepts downstream WireGuard
 clients and sends their traffic through the upstream tunnel described by the
 wg-quick configuration:
@@ -165,6 +180,32 @@ ANSIBLE_INVENTORY=inventory.ini \
 The `-e` options in the following examples are Ansible extra variables, not
 Bash environment variables. Extra variables passed on the command line
 override the defaults defined in a playbook.
+
+### Configure the ZeroTier Network
+
+Point `inventory.ini` at the DHCP address obtained by `eth2`, then run:
+
+```bash
+./run-ansible.sh \
+  --inventory inventory.ini \
+  playbooks/configure-zerotier.yml \
+  -e zerotier_network_id="<ZEROTIER_NETWORK_ID>" \
+  -e zerotier_exit_ip="<ZEROTIER_EXIT_IP>"
+```
+
+`zerotier_network_id` and `zerotier_exit_ip` have no defaults and must be
+provided for every run.
+
+The playbook prints the ZeroTier node ID and waits up to 600 seconds for
+controller authorization. It requires the selected network to report `OK`,
+requires an assigned IPv4 CIDR in `zerotier-cli -j listnetworks`, and verifies
+that the same IPv4 is present on the discovered `zt*` interface. If the
+controller has assigned IPv4 but the interface has not applied it, the
+playbook runs `/etc/init.d/zerotier restart`, waits 13 seconds, and checks the
+controller and interface again. Route and firewall configuration is applied
+only after all checks succeed. After the OpenWrt network reload, the playbook
+verifies the interface IPv4 a second time. The restart delay can be overridden
+with `zerotier_restart_delay`.
 
 ### Create a WireGuard Client Configuration
 

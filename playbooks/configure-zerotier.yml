@@ -1,0 +1,249 @@
+---
+- name: Join and configure the OpenWrt ZeroTier network
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    zerotier_interface: zerotier
+    zerotier_device: ''
+    zerotier_default_route: zt_default
+    zerotier_route_metric: 5000
+    zerotier_firewall_zone: zerotier
+    lan_firewall_zone: lan
+    zerotier_authorization_timeout: 600
+    zerotier_poll_interval: 2
+    zerotier_restart_delay: 13
+
+  pre_tasks:
+    - name: Validate ZeroTier parameters
+      ansible.builtin.assert:
+        that:
+          - (zerotier_network_id | default('') | string) is match('^[0-9A-Fa-f]{16}$')
+          - (zerotier_exit_ip | default('') | string) is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+          - zerotier_interface | string is match('^[A-Za-z0-9_]+$')
+          - zerotier_device | string | length == 0 or zerotier_device | string is match('^[A-Za-z0-9_.-]+$')
+          - zerotier_default_route | string is match('^[A-Za-z0-9_]+$')
+          - zerotier_firewall_zone | string is match('^[A-Za-z0-9_]+$')
+          - lan_firewall_zone | string is match('^[A-Za-z0-9_]+$')
+          - zerotier_route_metric | int > 0
+          - zerotier_authorization_timeout | int > 0
+          - zerotier_poll_interval | int > 0
+          - zerotier_restart_delay | int > 0
+        fail_msg: >-
+          zerotier_network_id and zerotier_exit_ip are required extra
+          variables. Check their formats and the remaining ZeroTier settings.
+
+  tasks:
+    - name: Keep the appliance IPv4-only
+      ansible.builtin.raw: |
+        set -eu
+        command -v sysctl >/dev/null 2>&1 || {
+          echo 'Error: sysctl is required to disable IPv6.' >&2
+          exit 1
+        }
+
+        mkdir -p /etc/sysctl.d
+        cat > /etc/sysctl.d/99-disable-ipv6.conf <<'SYSCTL_EOF'
+        net.ipv6.conf.all.disable_ipv6=1
+        net.ipv6.conf.default.disable_ipv6=1
+        net.ipv6.conf.lo.disable_ipv6=1
+        SYSCTL_EOF
+        sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
+        sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+        sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null
+
+        uci -q delete network.lan.ip6assign || true
+        uci -q delete network.wan6 || true
+        uci commit network
+      changed_when: true
+
+    - name: Enable ZeroTier and request network membership
+      ansible.builtin.raw: |
+        set -eu
+        for command in uci zerotier-cli; do
+          command -v "$command" >/dev/null 2>&1 || {
+            echo "Error: $command is missing; rebuild with install-zerotier.yml." >&2
+            exit 1
+          }
+        done
+
+        uci set zerotier.global='zerotier'
+        uci set zerotier.global.enabled='1'
+        uci -q delete zerotier.earth || true
+        uci set zerotier.ansible_network='network'
+        uci set zerotier.ansible_network.id={{ zerotier_network_id | lower | quote }}
+        uci set zerotier.ansible_network.allow_managed='1'
+        uci set zerotier.ansible_network.allow_global='0'
+        uci set zerotier.ansible_network.allow_default='0'
+        uci set zerotier.ansible_network.allow_dns='0'
+        uci commit zerotier
+        /etc/init.d/zerotier enable
+        /etc/init.d/zerotier restart >/dev/null
+
+        attempt=0
+        while [ "$attempt" -lt 30 ]; do
+          node_id="$(zerotier-cli info 2>/dev/null | awk '{print $3}' || true)"
+          [ -z "$node_id" ] || {
+            printf '%s\n' "$node_id"
+            exit 0
+          }
+          attempt=$((attempt + 1))
+          sleep 1
+        done
+        echo 'Error: ZeroTier did not return a node ID.' >&2
+        exit 1
+      register: zerotier_membership_request
+      changed_when: true
+
+    - name: Ask the operator to authorize this ZeroTier node
+      ansible.builtin.debug:
+        msg: >-
+          Waiting up to {{ zerotier_authorization_timeout }} seconds for node
+          {{ zerotier_membership_request.stdout | regex_replace('\\r', '') | trim }}
+          to be authorized in ZeroTier network {{ zerotier_network_id }}.
+
+    - name: Wait for ZeroTier controller authorization
+      ansible.builtin.raw: |
+        set -eu
+        command -v jsonfilter >/dev/null 2>&1 || {
+          echo 'Error: jsonfilter is required.' >&2
+          exit 1
+        }
+
+        configured_device={{ zerotier_device | quote }}
+        restart_attempted='0'
+        last_network_status=''
+        last_device=''
+        last_assigned_ipv4=''
+        elapsed=0
+        while [ "$elapsed" -lt {{ zerotier_authorization_timeout | int }} ]; do
+          status="$(zerotier-cli -j listnetworks 2>/dev/null || true)"
+          network_status=''
+          discovered_device=''
+          assigned_ipv4=''
+          network_index=0
+          while [ "$network_index" -lt 32 ] && [ -n "$status" ]; do
+            listed_id="$(printf '%s' "$status" | jsonfilter -e "@[$network_index].nwid" 2>/dev/null || true)"
+            [ -n "$listed_id" ] || break
+            if [ "$listed_id" = '{{ zerotier_network_id | lower }}' ]; then
+              network_status="$(printf '%s' "$status" | jsonfilter -e "@[$network_index].status" 2>/dev/null || true)"
+              discovered_device="$(printf '%s' "$status" | jsonfilter -e "@[$network_index].portDeviceName" 2>/dev/null || true)"
+
+              address_index=0
+              while [ "$address_index" -lt 32 ]; do
+                assigned_address="$(printf '%s' "$status" | jsonfilter -e "@[$network_index].assignedAddresses[$address_index]" 2>/dev/null || true)"
+                [ -n "$assigned_address" ] || break
+                case "$assigned_address" in
+                  *:*) ;;
+                  */*) assigned_ipv4="$assigned_address"; break ;;
+                esac
+                address_index=$((address_index + 1))
+              done
+              break
+            fi
+            network_index=$((network_index + 1))
+          done
+
+          if [ -n "$configured_device" ]; then
+            wanted_device="$configured_device"
+          else
+            wanted_device="$discovered_device"
+          fi
+
+          last_network_status="$network_status"
+          last_device="$wanted_device"
+          last_assigned_ipv4="$assigned_ipv4"
+
+          if [ "$network_status" = 'OK' ] && [ -n "$assigned_ipv4" ] && \
+              [ -n "$wanted_device" ] && ip link show "$wanted_device" >/dev/null 2>&1; then
+            assigned_ip=${assigned_ipv4%/*}
+            if ip -4 -o address show dev "$wanted_device" scope global | \
+                awk '{address=$4; sub(/\/.*/, "", address); print address}' | \
+                grep -Fqx "$assigned_ip"; then
+              printf '%s\n' "$wanted_device"
+              exit 0
+            fi
+
+            if [ "$restart_attempted" = '0' ]; then
+              echo "ZeroTier controller assigned $assigned_ipv4, but $wanted_device has no matching IPv4; restarting ZeroTier once and waiting {{ zerotier_restart_delay | int }} seconds." >&2
+              /etc/init.d/zerotier restart >/dev/null 2>&1
+              restart_attempted='1'
+              sleep {{ zerotier_restart_delay | int }}
+              elapsed=$((elapsed + {{ zerotier_restart_delay | int }}))
+              continue
+            fi
+          fi
+          sleep {{ zerotier_poll_interval | int }}
+          elapsed=$((elapsed + {{ zerotier_poll_interval | int }}))
+        done
+
+        echo "Error: timed out waiting for an authorized ZeroTier IPv4 on the interface (status=${last_network_status:-unknown}, device=${last_device:-unknown}, controller_ipv4=${last_assigned_ipv4:-none}, restarted=$restart_attempted)." >&2
+        exit 1
+      register: zerotier_authorization
+      changed_when: false
+
+    - name: Store the authorized ZeroTier device name
+      ansible.builtin.set_fact:
+        zerotier_runtime_device: "{{ zerotier_authorization.stdout | regex_replace('\\r', '') | trim }}"
+
+    - name: Configure the authorized ZeroTier interface, route, and firewall
+      ansible.builtin.raw: |
+        set -eu
+        ip link show {{ zerotier_runtime_device | quote }} >/dev/null
+
+        # A network reload can trigger fw4 through hotplug, so repair any
+        # duplicate zone names before changing or reloading the network.
+        for section in $(uci -q -X show firewall | sed -n 's/^firewall\.\([^.=]*\)=zone$/\1/p'); do
+          [ "$section" = '{{ zerotier_firewall_zone }}' ] && continue
+          zone_name="$(uci -q get "firewall.$section.name" || true)"
+          [ "$zone_name" != '{{ zerotier_firewall_zone }}' ] || uci -q delete "firewall.$section"
+        done
+
+        uci set firewall.{{ zerotier_firewall_zone }}='zone'
+        uci set firewall.{{ zerotier_firewall_zone }}.name='{{ zerotier_firewall_zone }}'
+        uci -q delete firewall.{{ zerotier_firewall_zone }}.network || true
+        uci add_list firewall.{{ zerotier_firewall_zone }}.network='{{ zerotier_interface }}'
+        uci set firewall.{{ zerotier_firewall_zone }}.input='REJECT'
+        uci set firewall.{{ zerotier_firewall_zone }}.output='ACCEPT'
+        uci set firewall.{{ zerotier_firewall_zone }}.forward='REJECT'
+        uci set firewall.{{ zerotier_firewall_zone }}.masq='1'
+        uci set firewall.{{ zerotier_firewall_zone }}.mtu_fix='1'
+        uci set firewall.lan_to_zerotier='forwarding'
+        uci set firewall.lan_to_zerotier.src='{{ lan_firewall_zone }}'
+        uci set firewall.lan_to_zerotier.dest='{{ zerotier_firewall_zone }}'
+        uci commit firewall
+
+        uci set network.{{ zerotier_interface }}='interface'
+        uci set network.{{ zerotier_interface }}.proto='none'
+        uci set network.{{ zerotier_interface }}.device={{ zerotier_runtime_device | quote }}
+        uci set network.{{ zerotier_default_route }}='route'
+        uci set network.{{ zerotier_default_route }}.interface='{{ zerotier_interface }}'
+        uci set network.{{ zerotier_default_route }}.target='0.0.0.0/0'
+        uci set network.{{ zerotier_default_route }}.gateway={{ zerotier_exit_ip | quote }}
+        uci set network.{{ zerotier_default_route }}.metric='{{ zerotier_route_metric | int }}'
+        uci commit network
+        /etc/init.d/network reload
+        /etc/init.d/firewall restart
+
+        address_ready='0'
+        attempt=0
+        while [ "$attempt" -lt 15 ]; do
+          if ip -4 -o address show dev {{ zerotier_runtime_device | quote }} scope global | grep -q .; then
+            address_ready='1'
+            break
+          fi
+          attempt=$((attempt + 1))
+          sleep 1
+        done
+        [ "$address_ready" = '1' ] || {
+          echo 'Error: the ZeroTier IPv4 address disappeared after the OpenWrt network reload.' >&2
+          exit 1
+        }
+      changed_when: true
+
+    - name: Report ZeroTier status
+      ansible.builtin.raw: |
+        zerotier-cli listnetworks
+        ip -4 address show dev {{ zerotier_runtime_device | quote }}
+        ping -c 1 -W 2 -I {{ zerotier_runtime_device | quote }} {{ zerotier_exit_ip | quote }} 2>/dev/null || true
+      changed_when: false
