@@ -1,0 +1,183 @@
+---
+- name: Configure an OpenWrt local DNS override
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    local_dns_route_device: eth2
+    local_dns_canonical_domain: >-
+      {{ local_dns_domain | default('invalid') | lower }}
+    local_dns_section_slug: >-
+      {{ local_dns_canonical_domain |
+         regex_replace('[^a-z0-9]+', '_') |
+         regex_replace('^_+|_+$', '') }}
+    local_dns_section_hash: >-
+      {{ (local_dns_canonical_domain | hash('sha1'))[:10] }}
+    local_dns_section_name: >-
+      local_dns_{{ local_dns_section_slug[:40] }}_{{ local_dns_section_hash }}
+    dns_name_pattern: '^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
+    ipv4_address_pattern: '^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'
+    dnsmasq_verify_attempts: 10
+    dnsmasq_verify_delay: 1
+
+  pre_tasks:
+    - name: Validate local DNS parameters
+      ansible.builtin.assert:
+        that:
+          - (local_dns_domain | default('') | string) is match(dns_name_pattern)
+          - (local_dns_ip | default('') | string) is match(ipv4_address_pattern)
+          - local_dns_section_name | string is match('^[a-z0-9_]+$')
+          - local_dns_section_name | length <= 61
+          - local_dns_route_device | string is match('^[A-Za-z0-9_.-]+$')
+          - dnsmasq_verify_attempts | int > 0
+          - dnsmasq_verify_delay | int >= 0
+        fail_msg: >-
+          local_dns_domain and local_dns_ip are required. Supply a valid
+          fully qualified domain name and a bare IPv4 address without a CIDR
+          suffix. Also check the route-device and verification settings.
+
+    - name: Require dnsmasq and an eth2 route to the target
+      ansible.builtin.raw: |
+        set -eu
+
+        for command in uci ip nslookup mktemp awk grep sed cp rm sleep; do
+          command -v "$command" >/dev/null 2>&1 || {
+            echo "Error: required command $command is unavailable." >&2
+            exit 1
+          }
+        done
+        [ -s /etc/config/dhcp ] || {
+          echo 'Error: /etc/config/dhcp is missing or empty.' >&2
+          exit 1
+        }
+        [ -x /etc/init.d/dnsmasq ] || {
+          echo 'Error: the dnsmasq service is not installed.' >&2
+          exit 1
+        }
+        ip -4 route get {{ local_dns_ip | quote }} | \
+          awk -v device={{ local_dns_route_device | quote }} '
+            {
+              for (field = 1; field < NF; field++)
+                if ($field == "dev" && $(field + 1) == device)
+                  found = 1
+            }
+            END { exit !found }
+          ' || {
+          echo 'Error: the target IPv4 is not routed through {{ local_dns_route_device }}; complete the PBR/internal-route stage first.' >&2
+          exit 1
+        }
+      changed_when: false
+
+  tasks:
+    - name: Check the existing local DNS mapping
+      ansible.builtin.raw: |
+        set -eu
+
+        target_name={{ local_dns_canonical_domain | quote }}
+        canonical_section={{ local_dns_section_name | quote }}
+        matching_sections=0
+
+        for section in $(uci -q -X show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=domain$/\1/p'); do
+          section_names="$(uci -q get "dhcp.$section.name" || true)"
+          case " $section_names " in
+            *" $target_name "*)
+              matching_sections=$((matching_sections + 1))
+              [ "$section" = "$canonical_section" ] || continue
+              ;;
+          esac
+        done
+
+        if [ "$matching_sections" -eq 1 ] && \
+            [ "$(uci -q get "dhcp.$canonical_section" || true)" = 'domain' ] && \
+            [ "$(uci -q get "dhcp.$canonical_section.name" || true)" = "$target_name" ] && \
+            [ "$(uci -q get "dhcp.$canonical_section.ip" || true)" = {{ local_dns_ip | quote }} ]; then
+          echo 'CURRENT'
+        else
+          echo 'NEEDS_CHANGE'
+        fi
+      register: local_dns_state
+      changed_when: false
+
+    - name: Configure and verify the local DNS mapping
+      ansible.builtin.raw: |
+        set -eu
+
+        target_name={{ local_dns_canonical_domain | quote }}
+        target_ip={{ local_dns_ip | quote }}
+        canonical_section={{ local_dns_section_name | quote }}
+        backup_file="$(mktemp /tmp/dhcp.local-dns.XXXXXX)"
+
+        cleanup() {
+          rm -f "$backup_file"
+        }
+        rollback() {
+          cp "$backup_file" /etc/config/dhcp
+          /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT INT TERM
+        cp /etc/config/dhcp "$backup_file"
+
+        # Remove equivalent sections so dnsmasq has one authoritative record.
+        for section in $(uci -q -X show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=domain$/\1/p'); do
+          [ "$section" = "$canonical_section" ] && continue
+          section_names="$(uci -q get "dhcp.$section.name" || true)"
+          case " $section_names " in
+            *" $target_name "*) uci -q delete "dhcp.$section" ;;
+          esac
+        done
+
+        uci set "dhcp.$canonical_section=domain"
+        uci set "dhcp.$canonical_section.name=$target_name"
+        uci set "dhcp.$canonical_section.ip=$target_ip"
+        uci commit dhcp
+
+        if ! /etc/init.d/dnsmasq restart; then
+          echo 'Error: dnsmasq restart failed; restoring the previous DHCP configuration.' >&2
+          rollback
+          exit 1
+        fi
+
+        attempt=0
+        while [ "$attempt" -lt {{ dnsmasq_verify_attempts | int }} ]; do
+          if nslookup "$target_name" 127.0.0.1 2>/dev/null | \
+              awk -v target="$target_ip" '
+                {
+                  for (field = 1; field <= NF; field++)
+                    if ($field == target)
+                      found = 1
+                }
+                END { exit !found }
+              '; then
+            exit 0
+          fi
+          attempt=$((attempt + 1))
+          sleep {{ dnsmasq_verify_delay | int }}
+        done
+
+        echo "Error: dnsmasq did not resolve $target_name to the requested IPv4; restoring the previous DHCP configuration." >&2
+        rollback
+        exit 1
+      when: "'NEEDS_CHANGE' in local_dns_state.stdout"
+      changed_when: true
+
+    - name: Report local DNS and route status
+      ansible.builtin.raw: |
+        set -eu
+        target_ip={{ local_dns_ip | quote }}
+
+        uci show dhcp.{{ local_dns_section_name }}
+        lookup_output="$(nslookup {{ local_dns_canonical_domain | quote }} 127.0.0.1)"
+        printf '%s\n' "$lookup_output"
+        printf '%s\n' "$lookup_output" | awk -v target="$target_ip" '
+          {
+            for (field = 1; field <= NF; field++)
+              if ($field == target)
+                found = 1
+          }
+          END { exit !found }
+        ' || {
+          echo 'Error: local DNS returned no exact match for the requested IPv4.' >&2
+          exit 1
+        }
+        ip -4 route get {{ local_dns_ip | quote }}
+      changed_when: false
