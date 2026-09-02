@@ -225,11 +225,9 @@ Then configure routing and the China IPv4 list:
 ./run-ansible.sh \
   --inventory inventory.ini \
   playbooks/configure-zerotier-pbr.yml \
-  -e '{
-    "lan_source_subnet": "10.10.11.0/24",
-    "domestic_gateway": "<ETH2_GATEWAY>",
-    "internal_route_target": "<INTERNAL_ROUTE_TARGET_CIDR>"
-  }'
+  -e lan_source_subnet="10.10.11.0/24" \
+  -e domestic_gateway="<ETH2_GATEWAY>" \
+  -e internal_route_target="<INTERNAL_ROUTE_TARGET_CIDR>"
 ```
 
 China IPv4 destinations are added to the PBR destination set for

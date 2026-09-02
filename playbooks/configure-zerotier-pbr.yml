@@ -232,7 +232,7 @@
 
         rm -f "$BATCH_FILE"
 
-        # LAN 的其余 IPv4 流量交给 ZeroTier。
+        # Send the remaining IPv4 traffic from the LAN through ZeroTier.
         nft "add element inet fw4 $ZT_SOURCE_SET { {{ lan_source_subnet }} }" || return 1
 
         return 0
@@ -323,7 +323,7 @@
         [ ! -s "$CURRENT" ] || cp "$CURRENT" "$OLD"
         mv "$NEW" "$CURRENT"
 
-        # pbr 返回 warning 时可能是非零，因此以实际集合存在为准。
+        # PBR may return nonzero for warnings, so verify the actual nft sets.
         /etc/init.d/pbr restart >/dev/null 2>&1 || true
         if sets_ready; then
           logger -t china-pbr "updated successfully: $COUNT prefixes"
