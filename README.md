@@ -189,10 +189,8 @@ Point `inventory.ini` at the DHCP address obtained by `eth2`, then run:
 ./run-ansible.sh \
   --inventory inventory.ini \
   playbooks/configure-zerotier.yml \
-  -e '{
-    "zerotier_network_id": "<ZEROTIER_NETWORK_ID>",
-    "zerotier_exit_ip": "<ZEROTIER_EXIT_IP>"
-  }'
+  -e zerotier_network_id="<ZEROTIER_NETWORK_ID>" \
+  -e zerotier_exit_ip="<ZEROTIER_EXIT_IP>"
 ```
 
 `zerotier_network_id` and `zerotier_exit_ip` have no defaults and must be
