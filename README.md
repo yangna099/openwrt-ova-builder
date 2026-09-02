@@ -266,6 +266,50 @@ Important second-stage variables:
 | `china_list_min_prefixes` | `3000` | Minimum accepted list size. |
 | `china_list_max_prefixes` | `10000` | Maximum accepted list size. |
 
+### Configure a Local DNS Override
+
+Complete the second-stage PBR and internal-route configuration first. Then
+install the exact local DNS mapping with the third-stage playbook:
+
+```bash
+./run-ansible.sh \
+  --inventory inventory.ini \
+  playbooks/configure-local-dns.yml \
+  -e '{
+    "local_dns_domain": "<LOCAL_DNS_DOMAIN>",
+    "local_dns_ip": "<LOCAL_DNS_IPV4>"
+  }'
+```
+
+`local_dns_domain` and `local_dns_ip` are required and have no defaults. The
+domain must be a fully qualified domain name. The IP must be a bare IPv4
+address; use the host portion of the second stage's `internal_route_target`
+without the `/32` suffix. The playbook confirms that the target is routed
+through `eth2`, creates one canonical UCI `domain` section, restarts only
+`dnsmasq`, and verifies the answer through the local DNS server. If restart or
+DNS verification fails, it restores the previous DHCP configuration and
+restarts `dnsmasq` again.
+
+The UCI section name is generated automatically; it does not need to be passed
+to the playbook. Its format is `local_dns_<domain-slug>_<hash>`. The readable
+slug is derived from the first 40 characters of the lowercase domain, with
+non-alphanumeric characters replaced by underscores. The final 10 hexadecimal
+characters are derived from the domain's SHA-1 digest and prevent different
+domains with similar slugs from sharing a section. Running the playbook again
+for the same domain selects the same section and updates that record, while a
+different domain creates a separate record. SHA-1 is used only to generate a
+stable UCI identifier, not for security. The DNS record itself is also stored
+in lowercase because DNS names are case-insensitive.
+
+For example, `service.example.com` produces the section
+`local_dns_service_example_com_b21826b332`. A later run for that domain finds
+and updates this section instead of creating a duplicate.
+
+LAN clients receive the OpenWrt DNS server through DHCP by default. They
+resolve the supplied domain to the supplied IPv4; clients using an external
+DNS server must be changed to use OpenWrt DNS. This playbook does not modify
+routes, PBR, firewall rules, or the `eth2` management connection.
+
 ### Create a WireGuard Client Configuration
 
 [`create-wireguard-client.yml`](playbooks/create-wireguard-client.yml) performs
