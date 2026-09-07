@@ -6,7 +6,7 @@
   vars:
     ipv4_pattern: '^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'
     domain_pattern: '^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$'
-    # One managed rule per domain. Changing its IP replaces the same rule.
+    # One managed rule per domain. Changing its destination subnet replaces the same rule.
     wg_snat_id: "wg_snat_{{ (wg_snat_domain | lower | hash('sha256'))[:16] }}"
     wg_snat_path: "/etc/{{ wg_snat_id }}.nft"
     wg_snat_rule: >-
@@ -20,13 +20,14 @@
         that:
           - (wg_snat_source | default('') | string).split('/')[0] is match(ipv4_pattern)
           - (wg_snat_source | default('') | string) is match('^[0-9.]+/(?:[0-9]|[12][0-9]|3[0-2])$')
-          - (wg_snat_destination | default('') | string) is match(ipv4_pattern)
+          - (wg_snat_destination | default('') | string).split('/')[0] is match(ipv4_pattern)
+          - (wg_snat_destination | default('') | string) is match('^[0-9.]+/(?:[0-9]|[12][0-9]|3[0-2])$')
           - (wg_snat_address | default('') | string) is match(ipv4_pattern)
           - (wg_snat_upstream_dns | default('') | string) is match(ipv4_pattern)
           - (wg_snat_device | default('') | string) is match('^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,14}$')
           - (wg_snat_domain | default('') | string) is match(domain_pattern)
         fail_msg: >-
-          Supply wg_snat_source (IPv4 CIDR), wg_snat_destination (IPv4),
+          Supply wg_snat_source (IPv4 CIDR), wg_snat_destination (IPv4 CIDR),
           wg_snat_device (Linux device name), wg_snat_address (server IPv4),
           wg_snat_upstream_dns (IPv4), and wg_snat_domain (ASCII domain).
           Use separate -e name=value arguments; use ASCII hyphens in domains.
@@ -54,7 +55,8 @@
         section={{ wg_snat_id | quote }}
         rule_file={{ wg_snat_path | quote }}
         domain={{ wg_snat_domain | lower | quote }}
-        forward="/$domain/{{ wg_snat_upstream_dns }}"
+        upstream={{ wg_snat_upstream_dns | quote }}
+        forward="/$domain/$upstream"
         work="$(mktemp -d /tmp/wg-snat.XXXXXX)"
         cp /etc/config/firewall "$work/firewall"
         cp /etc/config/dhcp "$work/dhcp"
@@ -121,6 +123,15 @@
             break
           fi
         done
+        # Add the upstream globally, preserving all other DNS servers.
+        found=0
+        for value in $(uci -q get 'dhcp.@dnsmasq[0].server' || true); do
+          [ "$value" != "$upstream" ] || found=1
+        done
+        if [ "$found" -eq 0 ]; then
+          uci add_list "dhcp.@dnsmasq[0].server=$upstream"
+          dns_changed=1
+        fi
         found=0
         for value in $(uci -q get 'dhcp.@dnsmasq[0].rebind_domain' || true); do
           [ "$value" != "$domain" ] || found=1

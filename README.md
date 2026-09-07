@@ -316,7 +316,7 @@ required parameters as separate `-e name=value` arguments:
   --inventory inventory.ini \
   playbooks/configure-wireguard-snat.yml \
   -e wg_snat_source="<WG_SOURCE_CIDR>" \
-  -e wg_snat_destination="<DOMAIN_IPV4>" \
+  -e wg_snat_destination="<DESTINATION_CIDR>" \
   -e wg_snat_device="<OUTGOING_DEVICE>" \
   -e wg_snat_address="<WG_SERVER_EXTERNAL_IPV4>" \
   -e wg_snat_upstream_dns="<UPSTREAM_DNS_IPV4>" \
@@ -326,10 +326,10 @@ required parameters as separate `-e name=value` arguments:
 | Parameter | Meaning |
 | --- | --- |
 | `wg_snat_source` | WireGuard source subnet, as IPv4 CIDR. |
-| `wg_snat_destination` | Domain's destination IPv4, supplied explicitly. |
+| `wg_snat_destination` | Destination subnet, as IPv4 CIDR; use /32 for a single host. |
 | `wg_snat_device` | Outgoing Linux network device (`oifname`). |
 | `wg_snat_address` | WireGuard server's external IPv4 used for SNAT. |
-| `wg_snat_upstream_dns` | Upstream IPv4 in the domain forwarding entry to remove. |
+| `wg_snat_upstream_dns` | Global upstream DNS IPv4 to add; also identifies the domain forwarding entry to remove. |
 | `wg_snat_domain` | Domain for forwarding removal and the DNS rebind exception. |
 
 The playbook persists a domain-specific `/etc/wg_snat_<hash>.nft` file and a
@@ -338,15 +338,19 @@ UCI fw4 include in `inet fw4 srcnat`, before zone masquerading. This follows
 Repeated runs update the same domain's rule without adding duplicates;
 other domains retain their rules. Firewall reloads and reboots retain the rule.
 Existing routes and forwarding permissions must already allow this traffic.
-The destination is static: rerun with a new IP if the domain's address changes.
+The destination subnet is static and matches every IPv4 in that CIDR, not just
+the supplied domain. Rerun with a new CIDR when the destination network changes.
 SNAT applies to new connections; existing conntrack mappings remain in use.
 
 For `dhcp.@dnsmasq[0]`, the playbook removes exactly
 `/<DOMAIN>/<UPSTREAM_DNS_IPV4>` from `server` in this example, adds
-`<DOMAIN>` to `rebind_domain` if absent, commits DHCP and restarts
-dnsmasq only when DNS settings change. It **does not add an upstream DNS
-server or a DNS address override**. Remaining DNS configuration must resolve
-the domain correctly. Use ordinary ASCII `-` in the domain, not `‑`.
+`<UPSTREAM_DNS_IPV4>` to the global `server` list if absent, and adds
+`<DOMAIN>` to `rebind_domain` if absent. It commits DHCP and restarts dnsmasq
+only when DNS settings change. The global upstream can serve all domains,
+subject to existing domain-specific forwarding rules. Other upstream servers
+and resolver-file settings are preserved, so this is not an exclusive upstream.
+Changing the upstream parameter does not remove a previously added global
+server. No DNS address override is created. Use ordinary ASCII `-` in the domain, not `‑`.
 
 Parameters are validated before connecting. Pending UCI changes cause a
 failure before modification. The generated firewall is checked before reload;
