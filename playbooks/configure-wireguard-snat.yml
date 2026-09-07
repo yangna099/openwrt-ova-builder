@@ -1,0 +1,155 @@
+---
+- name: Configure persistent WireGuard destination SNAT and DNS rebind exception
+  hosts: openwrt
+  gather_facts: false
+
+  vars:
+    ipv4_pattern: '^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'
+    domain_pattern: '^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$'
+    # One managed rule per domain. Changing its IP replaces the same rule.
+    wg_snat_id: "wg_snat_{{ (wg_snat_domain | lower | hash('sha256'))[:16] }}"
+    wg_snat_path: "/etc/{{ wg_snat_id }}.nft"
+    wg_snat_rule: >-
+      ip saddr {{ wg_snat_source }} ip daddr {{ wg_snat_destination }}
+      oifname "{{ wg_snat_device }}" counter snat to {{ wg_snat_address }}
+      comment "{{ wg_snat_id }}"
+
+  pre_tasks:
+    - name: Validate all six required command-line parameters
+      ansible.builtin.assert:
+        that:
+          - (wg_snat_source | default('') | string).split('/')[0] is match(ipv4_pattern)
+          - (wg_snat_source | default('') | string) is match('^[0-9.]+/(?:[0-9]|[12][0-9]|3[0-2])$')
+          - (wg_snat_destination | default('') | string) is match(ipv4_pattern)
+          - (wg_snat_address | default('') | string) is match(ipv4_pattern)
+          - (wg_snat_upstream_dns | default('') | string) is match(ipv4_pattern)
+          - (wg_snat_device | default('') | string) is match('^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,14}$')
+          - (wg_snat_domain | default('') | string) is match(domain_pattern)
+        fail_msg: >-
+          Supply wg_snat_source (IPv4 CIDR), wg_snat_destination (IPv4),
+          wg_snat_device (Linux device name), wg_snat_address (server IPv4),
+          wg_snat_upstream_dns (IPv4), and wg_snat_domain (ASCII domain).
+          Use separate -e name=value arguments; use ASCII hyphens in domains.
+
+  tasks:
+    - name: Apply and verify persistent SNAT and DNS configuration
+      ansible.builtin.raw: |
+        set -eu
+        for tool in uci nft fw4 ip mktemp cp cmp rm grep; do
+          command -v "$tool" >/dev/null 2>&1 || {
+            echo "Error: required command $tool is unavailable." >&2
+            exit 1
+          }
+        done
+        [ -x /etc/init.d/firewall ] && [ -x /etc/init.d/dnsmasq ]
+        [ "$(uci -q get 'dhcp.@dnsmasq[0]')" = dnsmasq ]
+        ip link show dev {{ wg_snat_device | quote }} >/dev/null
+        nft list chain inet fw4 srcnat >/dev/null
+        # Never commit or discard another administrator's pending edits.
+        [ -z "$(uci changes firewall)$(uci changes dhcp)" ] || {
+          echo 'Error: commit or revert pending firewall/dhcp UCI changes first.' >&2
+          exit 1
+        }
+
+        section={{ wg_snat_id | quote }}
+        rule_file={{ wg_snat_path | quote }}
+        domain={{ wg_snat_domain | lower | quote }}
+        forward="/$domain/{{ wg_snat_upstream_dns }}"
+        work="$(mktemp -d /tmp/wg-snat.XXXXXX)"
+        cp /etc/config/firewall "$work/firewall"
+        cp /etc/config/dhcp "$work/dhcp"
+        existed=0
+        if [ -e "$rule_file" ]; then
+          cp "$rule_file" "$work/rule"
+          existed=1
+        fi
+        success=0
+        mutated=0
+        cleanup() {
+          result=$?
+          trap - EXIT
+          if [ "$success" -ne 1 ] && [ "$mutated" -eq 1 ]; then
+            echo 'Error: applying configuration failed; restoring previous files and services.' >&2
+            uci revert firewall || true
+            uci revert dhcp || true
+            cp "$work/firewall" /etc/config/firewall
+            cp "$work/dhcp" /etc/config/dhcp
+            if [ "$existed" -eq 1 ]; then
+              cp "$work/rule" "$rule_file"
+            else
+              rm -f "$rule_file"
+            fi
+            /etc/init.d/firewall reload || true
+            /etc/init.d/dnsmasq restart || true
+          fi
+          rm -rf "$work"
+          exit "$result"
+        }
+        trap cleanup EXIT
+        trap 'exit 1' HUP INT TERM
+
+        printf '%s\n' {{ wg_snat_rule | quote }} > "$work/desired"
+        firewall_changed=0
+        dns_changed=0
+        mutated=1
+        if ! cmp -s "$work/desired" "$rule_file"; then
+          cp "$work/desired" "$rule_file"
+          firewall_changed=1
+        fi
+        set_option() {
+          key=$1
+          value=$2
+          if [ "$(uci -q get "$key" || true)" != "$value" ]; then
+            uci set "$key=$value"
+            firewall_changed=1
+          fi
+        }
+        set_option "firewall.$section" include
+        set_option "firewall.$section.type" nftables
+        set_option "firewall.$section.path" "$rule_file"
+        # Run before zone masquerading can consume the connection's NAT mapping.
+        set_option "firewall.$section.position" chain-prepend
+        set_option "firewall.$section.chain" srcnat
+        set_option "firewall.$section.enabled" 1
+
+        # UCI list values here contain no spaces; disable pathname expansion.
+        set -f
+        for value in $(uci -q get 'dhcp.@dnsmasq[0].server' || true); do
+          if [ "$value" = "$forward" ]; then
+            uci del_list "dhcp.@dnsmasq[0].server=$forward"
+            dns_changed=1
+            break
+          fi
+        done
+        found=0
+        for value in $(uci -q get 'dhcp.@dnsmasq[0].rebind_domain' || true); do
+          [ "$value" != "$domain" ] || found=1
+        done
+        if [ "$found" -eq 0 ]; then
+          uci add_list "dhcp.@dnsmasq[0].rebind_domain=$domain"
+          dns_changed=1
+        fi
+        set +f
+
+        if [ "$firewall_changed" -eq 1 ]; then
+          uci commit firewall
+        fi
+        # Check the full generated ruleset before replacing the live firewall.
+        fw4 check
+        nft list chain inet fw4 srcnat > "$work/live"
+        if [ "$firewall_changed" -eq 1 ] || ! grep -Fq "comment \"$section\"" "$work/live"; then
+          /etc/init.d/firewall reload
+          firewall_changed=1
+        fi
+        nft list chain inet fw4 srcnat > "$work/live"
+        grep -Fq "comment \"$section\"" "$work/live"
+        if [ "$dns_changed" -eq 1 ]; then
+          uci commit dhcp
+          /etc/init.d/dnsmasq restart
+        fi
+        success=1
+        if [ "$firewall_changed" -eq 1 ] || [ "$dns_changed" -eq 1 ]; then
+          echo 'CHANGED: WireGuard SNAT/DNS configuration applied'
+        fi
+      register: wg_snat_result
+      changed_when: "'CHANGED: WireGuard SNAT/DNS configuration applied' in wg_snat_result.stdout"
