@@ -45,7 +45,7 @@ Build the ZeroTier appliance:
 ```
 
 The imported PVE virtual machine is named `openwrt-zt-pbr`. Its three embedded
-NICs are WAN `eth0`, LAN `eth1` at `10.10.11.1/24`, and Ansible management
+NICs are WAN `eth0`, LAN `eth1` at `<LAN_IPV4>/<LAN_PREFIX_LENGTH>`, and Ansible management
 `eth2`. The `eth2` NIC is preconfigured as DHCP interface `wan_internal` in
 the `internal` firewall zone, so it can be used before the post-import
 ZeroTier playbook runs. The appliance is configured as IPv4-only.
@@ -161,8 +161,8 @@ After creating the inventory, verify connectivity with a harmless raw command:
 
 ## Run Ansible Playbooks
 
-The two playbooks documented below create a WireGuard client configuration on
-the server and then apply that configuration to a client OpenWrt instance.
+The playbooks documented below configure the ZeroTier gateway and its optional
+second-stage PBR behavior, followed by the existing WireGuard workflows.
 
 `run-ansible.sh` supports the following operating-system environment variable:
 
@@ -194,7 +194,8 @@ Point `inventory.ini` at the DHCP address obtained by `eth2`, then run:
 ```
 
 `zerotier_network_id` and `zerotier_exit_ip` have no defaults and must be
-provided for every run.
+provided for every run. Each value is passed with a separate Ansible `-e`
+option.
 
 The playbook prints the ZeroTier node ID and waits up to 600 seconds for
 controller authorization. It requires the selected network to report `OK`,
@@ -206,6 +207,156 @@ controller and interface again. Route and firewall configuration is applied
 only after all checks succeed. After the OpenWrt network reload, the playbook
 verifies the interface IPv4 a second time. The restart delay can be overridden
 with `zerotier_restart_delay`.
+
+### Configure China/International PBR on Existing eth2
+
+Complete the ZeroTier playbook first. The second stage reuses the embedded
+`eth2` interface (`wan_internal`) and does not add or restart a NIC. Install
+PBR and its dependencies:
+
+```bash
+./run-ansible.sh \
+  --inventory inventory.ini \
+  playbooks/install-zerotier-pbr.yml
+```
+
+Then configure routing and the China IPv4 list:
+
+```bash
+./run-ansible.sh \
+  --inventory inventory.ini \
+  playbooks/configure-zerotier-pbr.yml \
+  -e lan_source_subnet="10.10.11.0/24" \
+  -e domestic_gateway="<ETH2_GATEWAY>" \
+  -e internal_route_target="<INTERNAL_ROUTE_TARGET_CIDR>"
+```
+
+China IPv4 destinations are added to the PBR destination set for
+`wan_internal`; remaining public IPv4 traffic sourced from
+`10.10.11.0/24` is added to the ZeroTier source set. Local and reserved
+destinations are ignored by PBR. The playbook preserves `input=ACCEPT` on the
+existing `internal` firewall zone, enables masquerading and `lan → internal`
+forwarding, and installs a persistent metric-500 default route through the
+supplied eth2 gateway for PBR. The ordinary main-table default remains on
+eth0 because it has a lower metric. A persistent and immediate host route to
+the supplied `/32` target is also installed through `eth2`. The playbook
+deliberately avoids `ifup`, `ifdown`, and network-service reloads so the
+Ansible connection through `eth2` remains up.
+
+The generated files are `/etc/pbr.d/10-china-zerotier` and
+`/usr/sbin/pbr_china4_zerotier.sh`. The updater downloads and validates the
+China IPv4 list, rolls back if PBR cannot recreate both nft sets, and runs
+daily at 04:17. Domain-specific routing is outside this stage.
+
+Important second-stage variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `lan_source_subnet` | `10.10.11.0/24` | LAN source routed through ZeroTier after domestic/local exceptions. |
+| `domestic_interface` | `wan_internal` | Existing DHCP interface used for China traffic. |
+| `domestic_device` | `eth2` | Existing management NIC; no new NIC is created. |
+| `domestic_firewall_zone` | `internal` | Existing management firewall zone retained by the playbook. |
+| `domestic_gateway` | Required | IPv4 next hop used by China traffic through eth2. |
+| `domestic_route_metric` | `500` | Metric of the backup main-table default route through eth2. |
+| `internal_route_target` | Required | `/32` host route installed through eth2. |
+| `china_list_url` | `https://china-operator-ip.yfgao.com/china.txt` | China IPv4 prefix source. |
+| `china_list_min_prefixes` | `3000` | Minimum accepted list size. |
+| `china_list_max_prefixes` | `10000` | Maximum accepted list size. |
+
+### Configure a Local DNS Override
+
+Complete the second-stage PBR and internal-route configuration first. Then
+install the exact local DNS mapping with the third-stage playbook:
+
+```bash
+./run-ansible.sh \
+  --inventory inventory.ini \
+  playbooks/configure-local-dns.yml \
+  -e local_dns_domain="<LOCAL_DNS_DOMAIN>" \
+  -e local_dns_ip="<LOCAL_DNS_IPV4>"
+```
+
+`local_dns_domain` and `local_dns_ip` are required and have no defaults. The
+domain must be a fully qualified domain name. The IP must be a bare IPv4
+address; use the host portion of the second stage's `internal_route_target`
+without the `/32` suffix. The playbook confirms that the target is routed
+through `eth2`, creates one canonical UCI `domain` section, restarts only
+`dnsmasq`, and verifies the answer through the local DNS server. If restart or
+DNS verification fails, it restores the previous DHCP configuration and
+restarts `dnsmasq` again.
+
+The UCI section name is generated automatically; it does not need to be passed
+to the playbook. Its format is `local_dns_<domain-slug>_<hash>`. The readable
+slug is derived from the first 40 characters of the lowercase domain, with
+non-alphanumeric characters replaced by underscores. The final 10 hexadecimal
+characters are derived from the domain's SHA-1 digest and prevent different
+domains with similar slugs from sharing a section. Running the playbook again
+for the same domain selects the same section and updates that record, while a
+different domain creates a separate record. SHA-1 is used only to generate a
+stable UCI identifier, not for security. The DNS record itself is also stored
+in lowercase because DNS names are case-insensitive.
+
+For example, `service.example.com` produces the section
+`local_dns_service_example_com_b21826b332`. A later run for that domain finds
+and updates this section instead of creating a duplicate.
+
+LAN clients receive the OpenWrt DNS server through DHCP by default. They
+resolve the supplied domain to the supplied IPv4; clients using an external
+DNS server must be changed to use OpenWrt DNS. This playbook does not modify
+routes, PBR, firewall rules, or the `eth2` management connection.
+
+### Configure WireGuard Server Destination SNAT
+
+Point the inventory at the configured OpenWrt WireGuard server (fw4/nftables),
+then replace the placeholders below with your actual values and pass all six
+required parameters as separate `-e name=value` arguments:
+
+```bash
+./run-ansible.sh \
+  --inventory inventory.ini \
+  playbooks/configure-wireguard-snat.yml \
+  -e wg_snat_source="<WG_SOURCE_CIDR>" \
+  -e wg_snat_destination="<DESTINATION_CIDR>" \
+  -e wg_snat_device="<OUTGOING_DEVICE>" \
+  -e wg_snat_address="<WG_SERVER_EXTERNAL_IPV4>" \
+  -e wg_snat_upstream_dns="<UPSTREAM_DNS_IPV4>" \
+  -e wg_snat_domain="<DOMAIN>"
+```
+
+| Parameter | Meaning |
+| --- | --- |
+| `wg_snat_source` | WireGuard source subnet, as IPv4 CIDR. |
+| `wg_snat_destination` | Destination subnet, as IPv4 CIDR; use /32 for a single host. |
+| `wg_snat_device` | Outgoing Linux network device (`oifname`). |
+| `wg_snat_address` | WireGuard server's external IPv4 used for SNAT. |
+| `wg_snat_upstream_dns` | Global upstream DNS IPv4 to add; also identifies the domain forwarding entry to remove. |
+| `wg_snat_domain` | Domain for forwarding removal and the DNS rebind exception. |
+
+The playbook persists a domain-specific `/etc/wg_snat_<hash>.nft` file and a
+UCI fw4 include in `inet fw4 srcnat`, before zone masquerading. This follows
+[fw4's chain include configuration](https://openwrt.org/docs/guide-user/firewall/firewall_configuration#includes_2203_and_later_with_fw4).
+Repeated runs update the same domain's rule without adding duplicates;
+other domains retain their rules. Firewall reloads and reboots retain the rule.
+Existing routes and forwarding permissions must already allow this traffic.
+The destination subnet is static and matches every IPv4 in that CIDR, not just
+the supplied domain. Rerun with a new CIDR when the destination network changes.
+SNAT applies to new connections; existing conntrack mappings remain in use.
+
+For `dhcp.@dnsmasq[0]`, the playbook removes exactly
+`/<DOMAIN>/<UPSTREAM_DNS_IPV4>` from `server` in this example, adds
+`<UPSTREAM_DNS_IPV4>` to the global `server` list if absent, and adds
+`<DOMAIN>` to `rebind_domain` if absent. It commits DHCP and restarts dnsmasq
+only when DNS settings change. The global upstream can serve all domains,
+subject to existing domain-specific forwarding rules. Other upstream servers
+and resolver-file settings are preserved, so this is not an exclusive upstream.
+Changing the upstream parameter does not remove a previously added global
+server. No DNS address override is created. Use ordinary ASCII `-` in the domain, not `‑`.
+
+Parameters are validated before connecting. Pending UCI changes cause a
+failure before modification. The generated firewall is checked before reload;
+application failures trigger restoration of the previous configuration files
+and service reload/restart. Unchanged runs avoid service restarts. Raw remote
+tasks are skipped by Ansible `--check`; use `--syntax-check` for syntax validation.
 
 ### Create a WireGuard Client Configuration
 
